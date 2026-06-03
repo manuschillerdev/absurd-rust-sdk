@@ -1,8 +1,8 @@
-use crate::error::{map_database_error, Error, Result};
-use crate::types::{duration_seconds_ceil, ClaimedTask, Json};
+use crate::error::{Error, Result, map_database_error};
+use crate::types::{ClaimedTask, Json, duration_seconds_ceil};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

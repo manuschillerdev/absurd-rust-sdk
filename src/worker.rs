@@ -1,4 +1,4 @@
-use crate::client::{claim_tasks, RegisteredTask};
+use crate::client::{RegisteredTask, claim_tasks};
 use crate::error::{Error, Result};
 use crate::executor::execute_claimed_catching;
 use crate::types::WorkerOptions;
