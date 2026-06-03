@@ -3,6 +3,7 @@ use thiserror::Error as ThisError;
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, ThisError)]
+#[non_exhaustive]
 pub enum Error {
     #[error("database error: {0}")]
     Database(#[from] tokio_postgres::Error),
@@ -18,6 +19,9 @@ pub enum Error {
 
     #[error("task {0:?} is not registered")]
     TaskNotRegistered(String),
+
+    #[error("task {0:?} is already registered")]
+    TaskAlreadyRegistered(String),
 
     #[error("task suspended")]
     Suspended,

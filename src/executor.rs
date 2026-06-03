@@ -258,6 +258,7 @@ fn error_name(err: &Error) -> &'static str {
         Error::Serialization(_) => "Serialization",
         Error::Config(_) => "Config",
         Error::TaskNotRegistered(_) => "TaskNotRegistered",
+        Error::TaskAlreadyRegistered(_) => "TaskAlreadyRegistered",
         Error::Suspended => "Suspended",
         Error::Cancelled => "Cancelled",
         Error::AlreadyFailed => "AlreadyFailed",

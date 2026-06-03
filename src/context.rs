@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -18,6 +18,7 @@ pub struct TaskContext {
     headers: Map<String, Value>,
     checkpoint_cache: HashMap<String, Value>,
     step_name_counter: HashMap<String, usize>,
+    reported_timeouts: HashSet<String>,
     claim_timeout: Duration,
     claim_timeout_seconds: i32,
     lease_tx: Option<watch::Sender<Duration>>,
@@ -61,6 +62,7 @@ impl TaskContext {
             headers,
             checkpoint_cache,
             step_name_counter: HashMap::new(),
+            reported_timeouts: HashSet::new(),
             claim_timeout,
             claim_timeout_seconds: duration_seconds_ceil(claim_timeout),
             lease_tx,
@@ -173,6 +175,16 @@ impl TaskContext {
             return Ok(serde_json::from_value(cached)?);
         }
 
+        if self.task.wake_event.as_deref() == Some(event_name) && self.task.event_payload.is_none()
+        {
+            self.task.wake_event = None;
+            self.task.event_payload = None;
+            self.reported_timeouts.insert(event_name.to_string());
+            return Err(Error::EventTimeout {
+                event: event_name.to_string(),
+            });
+        }
+
         let timeout_seconds = options.timeout.map(duration_seconds_ceil);
         let client = self.pool.get().await?;
         let row = client
@@ -198,10 +210,17 @@ impl TaskContext {
             return Err(Error::Suspended);
         }
 
-        let Some(payload) = payload else {
-            return Err(Error::EventTimeout {
-                event: event_name.to_string(),
-            });
+        let payload = match payload {
+            Some(payload) => {
+                self.reported_timeouts.remove(event_name);
+                payload
+            }
+            None if self.reported_timeouts.remove(event_name) => Value::Null,
+            None => {
+                return Err(Error::EventTimeout {
+                    event: event_name.to_string(),
+                });
+            }
         };
 
         self.checkpoint_cache
@@ -325,6 +344,7 @@ impl TaskContext {
 }
 
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct AwaitEventOptions {
     pub step_name: Option<String>,
     pub timeout: Option<Duration>,

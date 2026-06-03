@@ -15,7 +15,7 @@ This repository is intentionally independent from upstream while the Rust API is
 ## Quick start
 
 ```rust
-use absurd_rust_sdk::{Client, Result, Task, WorkerOptions};
+use absurd_rust_sdk::{Client, Result, Task, WorkBatchOptions};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -32,11 +32,11 @@ struct Output {
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = Client::from_env_queue("default").await?;
-    client.create_queue(None).await?;
+    client.create_queue().await?;
 
     let hello = Task::<Params, Output>::new("hello");
 
-    client.register(hello.clone(), |params, mut ctx| async move {
+    client.register(&hello, |params, mut ctx| async move {
         let message: String = ctx
             .step("greet", || async move { Ok(format!("hello, {}", params.name)) })
             .await?;
@@ -52,13 +52,9 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    let worker = client.start_worker(
-        WorkerOptions::new()
-            .concurrency(4)
-            .claim_timeout(Duration::from_secs(120)),
-    );
-
-    worker.close().await?;
+    client
+        .work_batch(WorkBatchOptions::new().claim_timeout(Duration::from_secs(120)))
+        .await?;
     Ok(())
 }
 ```
@@ -86,6 +82,9 @@ Each step result is checkpointed in Postgres. If the task retries, completed ste
 
 The SDK calls Absurd stored procedures directly:
 
+- `absurd.create_queue`
+- `absurd.drop_queue`
+- `absurd.list_queues`
 - `absurd.spawn_task`
 - `absurd.claim_task`
 - `absurd.complete_run`
@@ -99,6 +98,7 @@ The SDK calls Absurd stored procedures directly:
 - `absurd.cancel_task`
 - `absurd.cleanup_tasks`
 - `absurd.cleanup_events`
+- `absurd.current_time` for unknown-task deferral
 
 Retry, cancellation, idempotency, event wakeups, leases, and cleanup remain database-owned.
 
@@ -112,6 +112,8 @@ Next hardening targets:
 - Task-result polling APIs when targeting Absurd SQL versions that expose `get_task_result`.
 - Optional spawn/execution middleware for tracing/header propagation.
 - Broader TLS/pool configuration.
+
+Environment resolution uses `ABSURD_DATABASE_URL`, then `DATABASE_URL`, then `PGDATABASE`, then `postgresql://localhost/absurd`.
 
 ## License
 
