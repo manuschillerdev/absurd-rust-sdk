@@ -1,0 +1,31 @@
+[package]
+name = "absurd-rust-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["Manuel Schiller"]
+description = "Community Rust SDK for Absurd, a Postgres-native durable workflow system"
+license = "Apache-2.0"
+repository = "https://github.com/manuschillerdev/absurd-rust-sdk"
+readme = "README.md"
+keywords = ["absurd", "postgres", "workflow", "durable", "queue"]
+categories = ["asynchronous", "database"]
+
+[lib]
+name = "absurd_rust_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+hostname = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["runtime", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
