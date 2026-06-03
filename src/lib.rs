@@ -16,8 +16,8 @@ pub use context::{AwaitEventOptions, TaskContext};
 pub use error::{Error, Result};
 pub use task::Task;
 pub use types::{
-    CancellationPolicy, ClaimedTask, CleanupResult, Json, RetryStrategy, SpawnOptions, SpawnResult,
-    TaskOptions, UnknownTaskPolicy, WorkBatchOptions, WorkerOptions,
+    CancellationPolicy, CleanupResult, Json, RetryStrategy, SpawnOptions, SpawnResult, TaskOptions,
+    UnknownTaskPolicy, WorkBatchOptions, WorkerOptions,
 };
 pub use worker::Worker;
 

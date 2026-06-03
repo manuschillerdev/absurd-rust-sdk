@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub type Json = Value;
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum RetryStrategy {
     None,
     Fixed {
@@ -67,6 +68,7 @@ impl RetryStrategy {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct CancellationPolicy {
     pub max_duration: Option<Duration>,
     pub max_delay: Option<Duration>,
@@ -106,6 +108,7 @@ impl CancellationPolicy {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SpawnOptions {
     pub queue: Option<String>,
     pub max_attempts: Option<i32>,
@@ -175,6 +178,7 @@ impl SpawnOptions {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SpawnResult {
     pub task_id: Uuid,
     pub run_id: Uuid,
@@ -183,6 +187,7 @@ pub struct SpawnResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ClaimedTask {
     pub run_id: Uuid,
     pub task_id: Uuid,
@@ -197,6 +202,7 @@ pub struct ClaimedTask {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TaskOptions {
     pub name: String,
     pub queue: Option<String>,
@@ -231,6 +237,7 @@ impl TaskOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum UnknownTaskPolicy {
     /// Defer unknown claimed tasks briefly so another worker version can pick them up.
     #[default]
@@ -240,6 +247,7 @@ pub enum UnknownTaskPolicy {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct WorkerOptions {
     pub worker_id: Option<String>,
     pub claim_timeout: Duration,
@@ -304,9 +312,20 @@ impl WorkerOptions {
         self
     }
 
-    pub(crate) fn normalized(&self) -> NormalizedWorkerOptions {
+    pub(crate) fn normalized(&self) -> Result<NormalizedWorkerOptions> {
+        if self.claim_timeout.is_zero() {
+            return Err(Error::Config(
+                "claim timeout must be greater than zero".to_string(),
+            ));
+        }
+        if self.poll_interval.is_zero() {
+            return Err(Error::Config(
+                "poll interval must be greater than zero".to_string(),
+            ));
+        }
+
         let concurrency = self.concurrency.max(1);
-        NormalizedWorkerOptions {
+        Ok(NormalizedWorkerOptions {
             worker_id: self.worker_id.clone().unwrap_or_else(default_worker_id),
             claim_timeout: self.claim_timeout,
             claim_timeout_seconds: duration_seconds_ceil(self.claim_timeout),
@@ -315,7 +334,7 @@ impl WorkerOptions {
             poll_interval: self.poll_interval,
             unknown_task_policy: self.unknown_task_policy,
             fatal_on_lease_timeout: self.fatal_on_lease_timeout,
-        }
+        })
     }
 }
 
@@ -332,6 +351,7 @@ pub(crate) struct NormalizedWorkerOptions {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct WorkBatchOptions {
     pub worker_id: Option<String>,
     pub claim_timeout: Duration,
@@ -381,12 +401,18 @@ impl WorkBatchOptions {
             .unwrap_or_else(|| "worker".to_string())
     }
 
-    pub(crate) fn claim_timeout_seconds(&self) -> i32 {
-        duration_seconds_ceil(self.claim_timeout)
+    pub(crate) fn claim_timeout_seconds(&self) -> Result<i32> {
+        if self.claim_timeout.is_zero() {
+            return Err(Error::Config(
+                "claim timeout must be greater than zero".to_string(),
+            ));
+        }
+        Ok(duration_seconds_ceil(self.claim_timeout))
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CleanupResult {
     pub tasks_deleted: i32,
     pub events_deleted: i32,
@@ -396,9 +422,9 @@ pub(crate) fn validate_queue_name(queue_name: &str) -> Result<()> {
     if queue_name.trim().is_empty() {
         return Err(Error::Config("queue name must be provided".to_string()));
     }
-    if queue_name.len() > 57 {
+    if queue_name.chars().count() > 48 {
         return Err(Error::Config(format!(
-            "queue name {queue_name:?} is too long (max 57 bytes)"
+            "queue name {queue_name:?} is too long (max 48 characters)"
         )));
     }
     Ok(())

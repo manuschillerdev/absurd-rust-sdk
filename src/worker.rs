@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 
 pub struct Worker {
     shutdown_tx: watch::Sender<bool>,
-    handle: tokio::task::JoinHandle<Result<()>>,
+    handle: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl Worker {
@@ -19,8 +19,8 @@ impl Worker {
         queue_name: String,
         registry: Arc<RwLock<HashMap<String, RegisteredTask>>>,
         options: WorkerOptions,
-    ) -> Self {
-        let options = options.normalized();
+    ) -> Result<Self> {
+        let options = options.normalized()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(worker_loop(
             pool,
@@ -29,15 +29,25 @@ impl Worker {
             options,
             shutdown_rx,
         ));
-        Self {
+        Ok(Self {
             shutdown_tx,
-            handle,
-        }
+            handle: Some(handle),
+        })
     }
 
-    pub async fn close(self) -> Result<()> {
+    pub async fn close(mut self) -> Result<()> {
         let _ = self.shutdown_tx.send(true);
-        self.handle.await.map_err(Error::Join)?
+        if let Some(handle) = self.handle.take() {
+            handle.await.map_err(Error::Join)?
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -59,7 +69,9 @@ async fn worker_loop(
 
         let available = options.concurrency.saturating_sub(running.len());
         if available == 0 {
-            wait_for_capacity_or_shutdown(&mut running, &mut shutdown_rx).await?;
+            if wait_for_capacity_or_shutdown(&mut running, &mut shutdown_rx).await? {
+                break;
+            }
             continue;
         }
 
@@ -76,19 +88,25 @@ async fn worker_loop(
             Ok(tasks) => tasks,
             Err(err) => {
                 tracing::error!(error = %err, "failed to claim tasks");
-                wait_poll_interval_or_shutdown(
+                if wait_poll_interval_or_shutdown(
                     &mut running,
                     &mut shutdown_rx,
                     options.poll_interval,
                 )
-                .await?;
+                .await?
+                {
+                    break;
+                }
                 continue;
             }
         };
 
         if tasks.is_empty() {
-            wait_poll_interval_or_shutdown(&mut running, &mut shutdown_rx, options.poll_interval)
-                .await?;
+            if wait_poll_interval_or_shutdown(&mut running, &mut shutdown_rx, options.poll_interval)
+                .await?
+            {
+                break;
+            }
             continue;
         }
 
@@ -131,14 +149,14 @@ async fn drain_finished(running: &mut JoinSet<Result<()>>) -> Result<()> {
 async fn wait_for_capacity_or_shutdown(
     running: &mut JoinSet<Result<()>>,
     shutdown_rx: &mut watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     tokio::select! {
-        _ = shutdown_rx.changed() => Ok(()),
+        changed = shutdown_rx.changed() => Ok(changed.is_err() || *shutdown_rx.borrow()),
         result = running.join_next(), if !running.is_empty() => {
             if let Some(result) = result {
                 report_task_result(result)?;
             }
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -147,15 +165,15 @@ async fn wait_poll_interval_or_shutdown(
     running: &mut JoinSet<Result<()>>,
     shutdown_rx: &mut watch::Receiver<bool>,
     poll_interval: std::time::Duration,
-) -> Result<()> {
+) -> Result<bool> {
     tokio::select! {
-        _ = shutdown_rx.changed() => Ok(()),
-        _ = tokio::time::sleep(poll_interval) => Ok(()),
+        changed = shutdown_rx.changed() => Ok(changed.is_err() || *shutdown_rx.borrow()),
+        _ = tokio::time::sleep(poll_interval) => Ok(false),
         result = running.join_next(), if !running.is_empty() => {
             if let Some(result) = result {
                 report_task_result(result)?;
             }
-            Ok(())
+            Ok(false)
         }
     }
 }

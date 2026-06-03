@@ -57,7 +57,7 @@ impl Client {
 
         // Fail fast on bad configuration.
         let _ = pool.get().await?;
-        Ok(Self::from_pool(pool, queue_name))
+        Self::from_pool(pool, queue_name)
     }
 
     pub async fn from_env() -> Result<Self> {
@@ -68,13 +68,15 @@ impl Client {
         Self::connect_queue(resolve_database_url(None), queue_name).await
     }
 
-    pub fn from_pool(pool: Pool, queue_name: impl Into<String>) -> Self {
-        Self {
+    pub fn from_pool(pool: Pool, queue_name: impl Into<String>) -> Result<Self> {
+        let queue_name = queue_name.into();
+        validate_queue_name(&queue_name)?;
+        Ok(Self {
             pool,
-            queue_name: queue_name.into(),
+            queue_name,
             default_max_attempts: 5,
             registry: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     pub fn queue_name(&self) -> &str {
@@ -86,7 +88,7 @@ impl Client {
         self
     }
 
-    pub fn register<P, R, F, Fut>(&self, task: Task<P, R>, handler: F) -> Result<()>
+    pub fn register<P, R, F, Fut>(&self, task: &Task<P, R>, handler: F) -> Result<()>
     where
         P: DeserializeOwned + Send + 'static,
         R: Serialize + Send + 'static,
@@ -139,10 +141,14 @@ impl Client {
             handler: erased,
         };
 
-        self.registry
+        let mut registry = self
+            .registry
             .write()
-            .map_err(|_| Error::Config("task registry lock poisoned".to_string()))?
-            .insert(options.name, registered);
+            .map_err(|_| Error::Config("task registry lock poisoned".to_string()))?;
+        if registry.contains_key(&options.name) {
+            return Err(Error::TaskAlreadyRegistered(options.name));
+        }
+        registry.insert(options.name, registered);
         Ok(())
     }
 
@@ -155,7 +161,8 @@ impl Client {
     where
         P: Serialize,
     {
-        self.spawn_named(task.name(), params, options).await
+        self.spawn_with_task_options(task.options(), params, options)
+            .await
     }
 
     pub async fn spawn_named<P>(
@@ -167,12 +174,39 @@ impl Client {
     where
         P: Serialize,
     {
-        let task_name = task_name.as_ref();
+        self.spawn_resolved(task_name.as_ref(), None, params, options)
+            .await
+    }
+
+    async fn spawn_with_task_options<P>(
+        &self,
+        task_options: &TaskOptions,
+        params: P,
+        options: SpawnOptions,
+    ) -> Result<SpawnResult>
+    where
+        P: Serialize,
+    {
+        self.spawn_resolved(&task_options.name, Some(task_options), params, options)
+            .await
+    }
+
+    async fn spawn_resolved<P>(
+        &self,
+        task_name: &str,
+        task_options: Option<&TaskOptions>,
+        params: P,
+        options: SpawnOptions,
+    ) -> Result<SpawnResult>
+    where
+        P: Serialize,
+    {
         if task_name.trim().is_empty() {
             return Err(Error::Config("task name must be provided".to_string()));
         }
 
-        let (queue_name, max_attempts, cancellation) = self.resolve_spawn(task_name, &options)?;
+        let (queue_name, max_attempts, cancellation) =
+            self.resolve_spawn(task_name, task_options, &options)?;
         let params = serde_json::to_value(params)?;
         let options_json = options.to_sql_json(max_attempts, cancellation);
 
@@ -194,8 +228,13 @@ impl Client {
         })
     }
 
-    pub async fn create_queue(&self, queue_name: Option<&str>) -> Result<()> {
-        let queue_name = queue_name.unwrap_or(&self.queue_name);
+    pub async fn create_queue(&self) -> Result<()> {
+        let queue_name = self.queue_name.clone();
+        self.create_queue_in(queue_name).await
+    }
+
+    pub async fn create_queue_in(&self, queue_name: impl AsRef<str>) -> Result<()> {
+        let queue_name = queue_name.as_ref();
         validate_queue_name(queue_name)?;
         let client = self.pool.get().await?;
         client
@@ -205,8 +244,13 @@ impl Client {
         Ok(())
     }
 
-    pub async fn drop_queue(&self, queue_name: Option<&str>) -> Result<()> {
-        let queue_name = queue_name.unwrap_or(&self.queue_name);
+    pub async fn drop_queue(&self) -> Result<()> {
+        let queue_name = self.queue_name.clone();
+        self.drop_queue_in(queue_name).await
+    }
+
+    pub async fn drop_queue_in(&self, queue_name: impl AsRef<str>) -> Result<()> {
+        let queue_name = queue_name.as_ref();
         validate_queue_name(queue_name)?;
         let client = self.pool.get().await?;
         client
@@ -304,7 +348,7 @@ impl Client {
 
     pub async fn work_batch(&self, options: WorkBatchOptions) -> Result<usize> {
         let worker_id = options.worker_id_value();
-        let claim_timeout_seconds = options.claim_timeout_seconds();
+        let claim_timeout_seconds = options.claim_timeout_seconds()?;
         let batch_size = options.batch_size.max(1).min(i32::MAX as usize) as i32;
         let tasks = self
             .claim_tasks(&worker_id, claim_timeout_seconds, batch_size)
@@ -327,7 +371,7 @@ impl Client {
         Ok(count)
     }
 
-    pub fn start_worker(&self, options: WorkerOptions) -> Worker {
+    pub fn start_worker(&self, options: WorkerOptions) -> Result<Worker> {
         Worker::start(
             self.pool.clone(),
             self.queue_name.clone(),
@@ -364,6 +408,7 @@ impl Client {
     fn resolve_spawn(
         &self,
         task_name: &str,
+        task_options: Option<&TaskOptions>,
         options: &SpawnOptions,
     ) -> Result<(String, i32, Option<CancellationPolicy>)> {
         let registration = self.get_registration(task_name)?;
@@ -377,19 +422,30 @@ impl Client {
                     )));
                 }
             }
+            if let Some(task_queue) = task_options.and_then(|task| task.queue.as_deref()) {
+                if task_queue != registration.queue_name {
+                    return Err(Error::Config(format!(
+                        "typed task {task_name:?} targets queue {task_queue:?}, but registered queue is {:?}",
+                        registration.queue_name
+                    )));
+                }
+            }
             registration.queue_name.clone()
+        } else if let Some(queue) = options.queue.clone() {
+            queue
+        } else if let Some(queue) = task_options.and_then(|task| task.queue.clone()) {
+            queue
         } else {
-            options.queue.clone().ok_or_else(|| {
-                Error::Config(format!(
-                    "task {task_name:?} is not registered; provide SpawnOptions::queue for unregistered tasks"
-                ))
-            })?
+            return Err(Error::Config(format!(
+                "task {task_name:?} is not registered; provide SpawnOptions::queue or Task::queue for unregistered tasks"
+            )));
         };
         validate_queue_name(&queue_name)?;
 
         let max_attempts = options
             .max_attempts
             .or_else(|| registration.as_ref().and_then(|r| r.default_max_attempts))
+            .or_else(|| task_options.and_then(|task| task.default_max_attempts))
             .unwrap_or(self.default_max_attempts);
         if max_attempts < 1 {
             return Err(Error::Config("max attempts must be at least 1".to_string()));
@@ -398,7 +454,8 @@ impl Client {
         let cancellation = options
             .cancellation
             .clone()
-            .or_else(|| registration.and_then(|r| r.default_cancellation));
+            .or_else(|| registration.and_then(|r| r.default_cancellation))
+            .or_else(|| task_options.and_then(|task| task.default_cancellation.clone()));
 
         Ok((queue_name, max_attempts, cancellation))
     }
@@ -444,6 +501,11 @@ fn resolve_database_url(explicit: Option<&str>) -> String {
         return explicit.to_string();
     }
     if let Ok(url) = std::env::var("ABSURD_DATABASE_URL") {
+        if !url.trim().is_empty() {
+            return url;
+        }
+    }
+    if let Ok(url) = std::env::var("DATABASE_URL") {
         if !url.trim().is_empty() {
             return url;
         }

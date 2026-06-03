@@ -17,11 +17,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let client = Client::from_env_queue("default").await?;
-    client.create_queue(None).await?;
+    client.create_queue().await?;
 
     let hello = Task::<HelloParams, HelloResult>::new("hello-world");
 
-    client.register(hello.clone(), |params, mut ctx| async move {
+    client.register(&hello, |params, mut ctx| async move {
         let greeting: String = ctx
             .step("build-greeting", || async move {
                 Ok(format!("hello, {}", params.name))

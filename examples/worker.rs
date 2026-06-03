@@ -24,11 +24,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let client = Client::from_env_queue("orders").await?;
-    client.create_queue(None).await?;
+    client.create_queue().await?;
 
     let order = Task::<OrderParams, OrderResult>::new("order-fulfillment").queue("orders");
 
-    client.register(order, |params, mut ctx| async move {
+    client.register(&order, |params, mut ctx| async move {
         let task_id = ctx.task_id();
         let order_id = params.order_id;
         let email = params.email;
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         WorkerOptions::new()
             .concurrency(8)
             .claim_timeout(Duration::from_secs(120)),
-    );
+    )?;
 
     tokio::signal::ctrl_c()
         .await
