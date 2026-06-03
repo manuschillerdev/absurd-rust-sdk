@@ -1,7 +1,7 @@
 use absurd_rust_sdk::{
-    AwaitEventOptions, Client, Error, Result, SpawnOptions, Task, WorkBatchOptions,
+    AwaitEventOptions, Client, Error, Result, RetryStrategy, SpawnOptions, Task, WorkBatchOptions,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{
@@ -249,6 +249,56 @@ async fn repeated_step_names_are_numbered() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn sleep_until_suspends_then_resumes_from_checkpoint() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let executions = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("sleepy").queue(&queue);
+    client.register(&task, {
+        let executions = Arc::clone(&executions);
+        move |(), mut ctx| {
+            let executions = Arc::clone(&executions);
+            async move {
+                let execution = executions.fetch_add(1, Ordering::SeqCst) + 1;
+                let wake_at = Utc::now() + ChronoDuration::seconds(1);
+                ctx.sleep_until("pause", wake_at).await?;
+                Ok(json!({ "executions": execution }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "sleeping");
+    assert_eq!(run.state, "sleeping");
+    assert!(run.wake_event.is_none());
+
+    let checkpoints = fetch_checkpoints(&queue, spawned.task_id).await?;
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].0, "pause");
+    let checkpoint_wake: DateTime<Utc> = serde_json::from_value(checkpoints[0].1.clone())?;
+    assert_eq!(run.available_at, Some(checkpoint_wake));
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(task.completed_payload, Some(json!({ "executions": 2 })));
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn pre_emitted_event_is_available_to_late_waiter() -> Result<()> {
     let (queue, client) = test_client().await?;
     let event_name = format!("pre_emitted_{queue}");
@@ -478,6 +528,60 @@ async fn failed_task_retries_immediately_until_success() -> Result<()> {
     assert_eq!(task.state, "completed");
     assert_eq!(task.attempts, 2);
     assert_eq!(task.completed_payload, Some(json!({ "attempts": 2 })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn fixed_retry_strategy_delays_next_attempt() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("fixed-retry")
+        .queue(&queue)
+        .default_max_attempts(2);
+    client.register(&task, {
+        let attempts = Arc::clone(&attempts);
+        move |(), _ctx| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    Err(Error::message("first attempt failed"))
+                } else {
+                    Ok(json!({ "attempts": attempt }))
+                }
+            }
+        }
+    })?;
+
+    let spawned = client
+        .spawn(
+            &task,
+            (),
+            SpawnOptions::new().retry_strategy(RetryStrategy::fixed(Duration::from_secs(1))),
+        )
+        .await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "sleeping");
+    assert_eq!(task.attempts, 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(task.attempts, 2);
+    assert_eq!(task.completed_payload, Some(json!({ "attempts": 2 })));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
     client.drop_queue().await?;
     Ok(())
