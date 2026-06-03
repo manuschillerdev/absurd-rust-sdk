@@ -1,14 +1,14 @@
 use crate::context::TaskContext;
-use crate::error::{map_database_error, Error, Result};
+use crate::error::{Error, Result, map_database_error};
 use crate::executor::execute_claimed_catching;
 use crate::task::Task;
 use crate::types::{
-    duration_seconds_ceil, validate_queue_name, CancellationPolicy, ClaimedTask, CleanupResult,
-    Json, SpawnOptions, SpawnResult, TaskOptions, WorkBatchOptions, WorkerOptions,
+    CancellationPolicy, ClaimedTask, CleanupResult, Json, SpawnOptions, SpawnResult, TaskOptions,
+    WorkBatchOptions, WorkerOptions, duration_seconds_ceil, validate_queue_name,
 };
 use crate::worker::Worker;
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;

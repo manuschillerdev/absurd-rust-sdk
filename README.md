@@ -113,6 +113,21 @@ Next hardening targets:
 - Optional spawn/execution middleware for tracing/header propagation.
 - Broader TLS/pool configuration.
 
+## Development
+
+The crate targets Rust 1.85+ and edition 2024.
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo deny check advisories bans licenses sources
+cargo package
+```
+
+`Cargo.lock` is intentionally not committed because this is a library crate; CI resolves the current compatible dependency graph and Dependabot tracks manifest/action updates.
+
 ## License
 
 Apache-2.0

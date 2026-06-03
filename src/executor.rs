@@ -1,6 +1,6 @@
 use crate::client::{RegisteredTask, TaskHandler};
 use crate::context::TaskContext;
-use crate::error::{map_database_error, Error, Result};
+use crate::error::{Error, Result, map_database_error};
 use crate::types::{ClaimedTask, Json, UnknownTaskPolicy};
 use deadpool_postgres::Pool;
 use serde_json::json;

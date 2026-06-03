@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::time::Duration;
 use uuid::Uuid;
 
