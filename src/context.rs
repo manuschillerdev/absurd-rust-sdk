@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -18,7 +18,6 @@ pub struct TaskContext {
     headers: Map<String, Value>,
     checkpoint_cache: HashMap<String, Value>,
     step_name_counter: HashMap<String, usize>,
-    reported_timeouts: HashSet<String>,
     claim_timeout: Duration,
     claim_timeout_seconds: i32,
     lease_tx: Option<watch::Sender<Duration>>,
@@ -62,7 +61,6 @@ impl TaskContext {
             headers,
             checkpoint_cache,
             step_name_counter: HashMap::new(),
-            reported_timeouts: HashSet::new(),
             claim_timeout,
             claim_timeout_seconds: duration_seconds_ceil(claim_timeout),
             lease_tx,
@@ -175,21 +173,11 @@ impl TaskContext {
             return Ok(serde_json::from_value(cached)?);
         }
 
-        if self.task.wake_event.as_deref() == Some(event_name) && self.task.event_payload.is_none()
-        {
-            self.task.wake_event = None;
-            self.task.event_payload = None;
-            self.reported_timeouts.insert(event_name.to_string());
-            return Err(Error::EventTimeout {
-                event: event_name.to_string(),
-            });
-        }
-
         let timeout_seconds = options.timeout.map(duration_seconds_ceil);
         let client = self.pool.get().await?;
         let row = client
             .query_one(
-                "SELECT should_suspend, payload
+                "SELECT *
                  FROM absurd.await_event($1, $2, $3, $4, $5, $6)",
                 &[
                     &self.queue_name,
@@ -203,28 +191,57 @@ impl TaskContext {
             .await
             .map_err(map_database_error)?;
 
-        let should_suspend: bool = row.get(0);
-        let payload: Option<Value> = row.get(1);
+        let supports_timed_out = match row.columns() {
+            columns if columns.len() == 2 => false,
+            columns
+                if columns.len() == 3
+                    && columns.iter().any(|column| column.name() == "timed_out") =>
+            {
+                true
+            }
+            columns => {
+                return Err(Error::message(format!(
+                    "absurd.await_event returned unexpected column shape: {} columns",
+                    columns.len()
+                )));
+            }
+        };
+
+        let should_suspend: bool = row.try_get(0)?;
+        let payload: Option<Value> = row.try_get(1)?;
+        let timed_out = if supports_timed_out {
+            row.try_get::<_, bool>("timed_out")?
+        } else {
+            false
+        };
 
         if should_suspend {
             return Err(Error::Suspended);
         }
 
-        let payload = match payload {
-            Some(payload) => {
-                self.reported_timeouts.remove(event_name);
-                payload
-            }
-            None if self.reported_timeouts.remove(event_name) => Value::Null,
-            None => {
-                return Err(Error::EventTimeout {
-                    event: event_name.to_string(),
-                });
-            }
+        let legacy_timed_out = !supports_timed_out
+            && payload.is_none()
+            && self.task.wake_event.as_deref() == Some(event_name)
+            && self.task.event_payload.is_none();
+
+        if timed_out || legacy_timed_out {
+            self.task.wake_event = None;
+            self.task.event_payload = None;
+            return Err(Error::EventTimeout {
+                event: event_name.to_string(),
+            });
+        }
+
+        let Some(payload) = payload else {
+            return Err(Error::message(
+                "absurd.await_event returned no payload without timing out",
+            ));
         };
 
         self.checkpoint_cache
             .insert(checkpoint_name, payload.clone());
+        self.task.wake_event = None;
+        self.task.event_payload = None;
         Ok(serde_json::from_value(payload)?)
     }
 
