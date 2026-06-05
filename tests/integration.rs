@@ -4,10 +4,10 @@
 //! with Absurd SQL. Run them locally with `ABSURD_DATABASE_URL=... cargo test-db`.
 
 use absurd_rust_sdk::{
-    AwaitEventOptions, AwaitTaskResultOptions, Client, CreateQueueOptions, Error, Hooks,
-    QueueDetachMode, QueuePolicyOptions, QueueStorageMode, Result, RetryStrategy, RetryTaskOptions,
-    SpawnOptions, Task, TaskResultSnapshot, UnknownTaskPolicy, WorkBatchOptions, WorkerErrorKind,
-    WorkerOptions,
+    AwaitEventOptions, AwaitTaskResultOptions, CancellationPolicy, Client, CreateQueueOptions,
+    Error, Hooks, QueueDetachMode, QueuePolicyOptions, QueueStorageMode, Result, RetryStrategy,
+    RetryTaskOptions, SpawnOptions, Task, TaskResultSnapshot, UnknownTaskPolicy, WorkBatchOptions,
+    WorkerErrorKind, WorkerOptions,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -47,6 +47,12 @@ struct RunRow {
     failure_reason: Option<Value>,
 }
 
+#[derive(Debug)]
+struct TaskSpawnMetadata {
+    retry_strategy: Option<Value>,
+    cancellation: Option<Value>,
+}
+
 fn database_url() -> String {
     std::env::var("ABSURD_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
@@ -62,6 +68,52 @@ async fn test_client() -> Result<(String, Client)> {
     let client = Client::connect_queue(database_url(), &queue).await?;
     client.create_queue().await?;
     Ok((queue, client))
+}
+
+async fn test_client_with_single_connection_pool()
+-> Result<(String, Client, deadpool_postgres::Pool)> {
+    let queue = random_queue();
+    let (client, pool) = connect_queue_with_single_connection_pool(&queue).await?;
+    client.create_queue().await?;
+    Ok((queue, client, pool))
+}
+
+async fn connect_queue_with_single_connection_pool(
+    queue: &str,
+) -> Result<(Client, deadpool_postgres::Pool)> {
+    let mut config = deadpool_postgres::Config::new();
+    config.url = Some(database_url());
+    config.pool = Some(deadpool_postgres::PoolConfig::new(1));
+    let pool = config
+        .create_pool(
+            Some(deadpool_postgres::Runtime::Tokio1),
+            tokio_postgres::NoTls,
+        )
+        .map_err(|err| Error::Config(format!("failed to create Postgres pool: {err}")))?;
+
+    let connection = pool.get().await?;
+    drop(connection);
+
+    Ok((Client::from_pool(pool.clone(), queue)?, pool))
+}
+
+fn utc(timestamp: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|err| Error::message(format!("invalid timestamp {timestamp:?}: {err}")))?
+        .with_timezone(&Utc))
+}
+
+async fn set_fake_now(
+    pool: &deadpool_postgres::Pool,
+    timestamp: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let pg = pool.get().await?;
+    let value = timestamp
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_default();
+    pg.execute("SELECT set_config('absurd.fake_now', $1, false)", &[&value])
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -200,6 +252,121 @@ async fn basic_typed_task_round_trip() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn spawn_resolution_applies_defaults_overrides_and_rejects_queue_mismatches() -> Result<()> {
+    let queue = random_queue();
+    let other_queue = random_queue();
+    let client = Client::connect_queue(database_url(), &queue)
+        .await?
+        .default_max_attempts(4);
+    client.create_queue().await?;
+    client.create_queue_in(&other_queue).await?;
+
+    let client_default_task = Task::<(), Value>::new("client-default-attempts").queue(&queue);
+    client.register(&client_default_task, |(), _ctx| async move {
+        Ok(json!({ "ok": true }))
+    })?;
+    let client_default = client
+        .spawn(&client_default_task, (), SpawnOptions::new())
+        .await?;
+    assert_eq!(
+        fetch_task(&queue, client_default.task_id)
+            .await?
+            .max_attempts,
+        Some(4)
+    );
+
+    let task_default = Task::<(), Value>::new("task-default-attempts")
+        .queue(&queue)
+        .default_max_attempts(2);
+    client.register(&task_default, |(), _ctx| async move {
+        Ok(json!({ "ok": true }))
+    })?;
+    let task_default_spawned = client.spawn(&task_default, (), SpawnOptions::new()).await?;
+    assert_eq!(
+        fetch_task(&queue, task_default_spawned.task_id)
+            .await?
+            .max_attempts,
+        Some(2)
+    );
+
+    let overridden = client
+        .spawn(&task_default, (), SpawnOptions::new().max_attempts(3))
+        .await?;
+    assert_eq!(
+        fetch_task(&queue, overridden.task_id).await?.max_attempts,
+        Some(3)
+    );
+
+    let missing_queue = client
+        .spawn_named("unregistered-without-queue", (), SpawnOptions::new())
+        .await;
+    assert!(
+        matches!(missing_queue, Err(Error::Config(message)) if message.contains("is not registered"))
+    );
+
+    let mismatched_queue = client
+        .spawn(
+            &task_default,
+            (),
+            SpawnOptions::new().queue(other_queue.clone()),
+        )
+        .await;
+    assert!(
+        matches!(mismatched_queue, Err(Error::Config(message)) if message.contains("spawn requested queue"))
+    );
+
+    client.drop_queue().await?;
+    client.drop_queue_in(&other_queue).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn work_batch_handles_mixed_success_and_failure() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let ok_a = Task::<(), Value>::new("mixed-ok-a").queue(&queue);
+    let ok_b = Task::<(), Value>::new("mixed-ok-b").queue(&queue);
+    let fail = Task::<(), Value>::new("mixed-fail")
+        .queue(&queue)
+        .default_max_attempts(1);
+
+    client.register(&ok_a, |(), _ctx| async move { Ok(json!({ "ok": "a" })) })?;
+    client.register(&ok_b, |(), _ctx| async move { Ok(json!({ "ok": "b" })) })?;
+    client.register(&fail, |(), _ctx| async move {
+        Err::<Value, Error>(Error::message("mixed batch failure"))
+    })?;
+
+    let spawned_ok_a = client.spawn(&ok_a, (), SpawnOptions::new()).await?;
+    let spawned_fail = client.spawn(&fail, (), SpawnOptions::new()).await?;
+    let spawned_ok_b = client.spawn(&ok_b, (), SpawnOptions::new()).await?;
+
+    assert_eq!(
+        client
+            .work_batch(WorkBatchOptions::new().batch_size(10))
+            .await?,
+        3
+    );
+
+    assert_eq!(
+        fetch_task(&queue, spawned_ok_a.task_id).await?.state,
+        "completed"
+    );
+    assert_eq!(
+        fetch_task(&queue, spawned_fail.task_id).await?.state,
+        "failed"
+    );
+    assert_eq!(
+        fetch_task(&queue, spawned_ok_b.task_id).await?.state,
+        "completed"
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn worker_close_waits_for_running_tasks() -> Result<()> {
     let (queue, client) = test_client().await?;
     let task = Task::<(), Value>::new("draining-task").queue(&queue);
@@ -236,7 +403,7 @@ async fn worker_close_waits_for_running_tasks() -> Result<()> {
         .map_err(|_| Error::message("worker did not start task"))?;
 
     let close = tokio::spawn(worker.close());
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
     assert!(!close.is_finished());
 
     release.notify_one();
@@ -247,6 +414,89 @@ async fn worker_close_waits_for_running_tasks() -> Result<()> {
     let task = fetch_task(&queue, spawned.task_id).await?;
     assert_eq!(task.state, "completed");
     assert_eq!(task.completed_payload, Some(json!({ "drained": true })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn worker_respects_concurrency_limit() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let task = Task::<i64, Value>::new("concurrency-limited").queue(&queue);
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let release_notify = Arc::new(Notify::new());
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<i64>();
+
+    client.register(&task, {
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        let release_notify = Arc::clone(&release_notify);
+        move |index, _ctx| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let release_notify = Arc::clone(&release_notify);
+            let started_tx = started_tx.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(index);
+                while !release.load(Ordering::SeqCst) {
+                    release_notify.notified().await;
+                }
+                Ok(json!({ "index": index }))
+            }
+        }
+    })?;
+
+    let spawned = [
+        client.spawn(&task, 1, SpawnOptions::new()).await?,
+        client.spawn(&task, 2, SpawnOptions::new()).await?,
+        client.spawn(&task, 3, SpawnOptions::new()).await?,
+    ];
+
+    let worker = client.start_worker(
+        WorkerOptions::new()
+            .concurrency(2)
+            .batch_size(3)
+            .poll_interval(Duration::from_millis(25))
+            .fatal_on_lease_timeout(false),
+    )?;
+
+    let mut started_indices = Vec::new();
+    for _ in 0..2 {
+        let index = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .map_err(|_| Error::message("worker did not start the first two tasks"))?
+            .ok_or_else(|| Error::message("started channel closed"))?;
+        started_indices.push(index);
+    }
+
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    for (offset, item) in spawned.iter().enumerate() {
+        let index = i64::try_from(offset + 1)
+            .map_err(|err| Error::message(format!("invalid task index: {err}")))?;
+        let task = fetch_task(&queue, item.task_id).await?;
+        if started_indices.contains(&index) {
+            assert_eq!(task.state, "running");
+        } else {
+            assert_eq!(task.state, "pending");
+        }
+    }
+
+    release.store(true, Ordering::SeqCst);
+    release_notify.notify_waiters();
+
+    tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+        .await
+        .map_err(|_| Error::message("worker did not start the third task after capacity freed"))?
+        .ok_or_else(|| Error::message("started channel closed"))?;
+
+    worker.close().await?;
+
+    for item in spawned {
+        assert_eq!(fetch_task(&queue, item.task_id).await?.state, "completed");
+    }
 
     client.drop_queue().await?;
     Ok(())
@@ -693,6 +943,177 @@ async fn context_can_await_completed_task_result_from_another_queue() -> Result<
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn context_await_task_result_waits_for_pending_child_in_other_queue() -> Result<()> {
+    let parent_queue = random_queue();
+    let child_queue = random_queue();
+    let parent = Client::connect_queue(database_url(), &parent_queue).await?;
+    let child = Client::connect_queue(database_url(), &child_queue).await?;
+    parent.create_queue().await?;
+    child.create_queue().await?;
+
+    let child_task = Task::<(), Value>::new("pending-child-result").queue(&child_queue);
+    child.register(&child_task, |(), _ctx| async move {
+        Ok(json!({ "child": "eventually done" }))
+    })?;
+
+    let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let parent_task =
+        Task::<uuid::Uuid, Value>::new("parent-waits-for-pending-child").queue(&parent_queue);
+    parent.register(&parent_task, {
+        let child_queue = child_queue.clone();
+        move |child_id, mut ctx| {
+            let child_queue = child_queue.clone();
+            let waiting_tx = waiting_tx.clone();
+            async move {
+                let _ = waiting_tx.send(());
+                let snapshot = ctx
+                    .await_task_result(
+                        child_id,
+                        AwaitTaskResultOptions::new()
+                            .queue(child_queue)
+                            .timeout(Duration::from_secs(5)),
+                    )
+                    .await?;
+                Ok(json!({ "snapshot": snapshot }))
+            }
+        }
+    })?;
+
+    let child_spawned = child.spawn(&child_task, (), SpawnOptions::new()).await?;
+    let parent_spawned = parent
+        .spawn(&parent_task, child_spawned.task_id, SpawnOptions::new())
+        .await?;
+
+    let parent_worker = {
+        let parent = parent.clone();
+        tokio::spawn(async move { parent.work_batch(WorkBatchOptions::new()).await })
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), waiting_rx.recv())
+        .await
+        .map_err(|_| Error::message("parent did not begin waiting for child result"))?
+        .ok_or_else(|| Error::message("parent wait channel closed"))?;
+    assert_eq!(child.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(
+        parent_worker.await.map_err(Error::Join)??,
+        1,
+        "parent task should complete after child result becomes available"
+    );
+
+    let task = fetch_task(&parent_queue, parent_spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({
+            "snapshot": {
+                "state": "completed",
+                "result": { "child": "eventually done" },
+            }
+        }))
+    );
+
+    parent.drop_queue().await?;
+    child.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn context_await_task_result_checkpoint_survives_parent_retry_after_child_cleanup()
+-> Result<()> {
+    let parent_queue = random_queue();
+    let child_queue = random_queue();
+    let parent = Client::connect_queue(database_url(), &parent_queue).await?;
+    let (child, child_pool) = connect_queue_with_single_connection_pool(&child_queue).await?;
+    parent.create_queue().await?;
+    child.create_queue().await?;
+
+    let base = utc("2024-05-01T08:00:00Z")?;
+    set_fake_now(&child_pool, Some(base)).await?;
+
+    let child_task = Task::<(), Value>::new("cleanup-child-result").queue(&child_queue);
+    child.register(&child_task, |(), _ctx| async move {
+        Ok(json!({ "child": "cached" }))
+    })?;
+    let child_spawned = child.spawn(&child_task, (), SpawnOptions::new()).await?;
+    assert_eq!(child.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let parent_task = Task::<uuid::Uuid, Value>::new("parent-caches-child-result")
+        .queue(&parent_queue)
+        .default_max_attempts(2);
+    parent.register(&parent_task, {
+        let child_queue = child_queue.clone();
+        let attempts = Arc::clone(&attempts);
+        move |child_id, mut ctx| {
+            let child_queue = child_queue.clone();
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let snapshot = ctx
+                    .await_task_result(
+                        child_id,
+                        AwaitTaskResultOptions::new()
+                            .queue(child_queue)
+                            .timeout(Duration::from_secs(1)),
+                    )
+                    .await?;
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    return Err(Error::message("retry after child result checkpoint"));
+                }
+                Ok(json!({ "snapshot": snapshot, "attempt": attempt }))
+            }
+        }
+    })?;
+
+    let parent_spawned = parent
+        .spawn(&parent_task, child_spawned.task_id, SpawnOptions::new())
+        .await?;
+    assert_eq!(parent.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(
+        fetch_task(&parent_queue, parent_spawned.task_id)
+            .await?
+            .state,
+        "pending"
+    );
+    assert_eq!(
+        fetch_checkpoints(&parent_queue, parent_spawned.task_id)
+            .await?
+            .len(),
+        1
+    );
+
+    set_fake_now(&child_pool, Some(base + ChronoDuration::hours(2))).await?;
+    let cleanup = child
+        .cleanup_with_limit(Duration::from_secs(3600), 10, None)
+        .await?;
+    assert_eq!(cleanup.tasks_deleted, 1);
+    assert_eq!(
+        child.fetch_task_result(child_spawned.task_id, None).await?,
+        None
+    );
+
+    assert_eq!(parent.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&parent_queue, parent_spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({
+            "snapshot": {
+                "state": "completed",
+                "result": { "child": "cached" },
+            },
+            "attempt": 2,
+        }))
+    );
+
+    parent.drop_queue().await?;
+    child.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn decomposed_step_handle_reuses_completed_state_after_retry() -> Result<()> {
     let (queue, client) = test_client().await?;
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -779,6 +1200,44 @@ async fn failed_decomposed_step_is_not_checkpointed_and_reexecutes() -> Result<(
     assert_eq!(
         fetch_checkpoints(&queue, spawned.task_id).await?,
         vec![("manual-fragile".to_string(), json!(123))]
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn repeated_decomposed_step_names_are_numbered() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("manual-loop-steps").queue(&queue);
+    client.register(&task, |(), mut ctx| async move {
+        let mut results = Vec::new();
+        for i in 0_i64..3 {
+            let handle = ctx.begin_step::<i64>("manual-loop").await?;
+            let value = ctx.complete_step(handle, i * 5).await?;
+            results.push(value);
+        }
+        Ok(json!({ "results": results }))
+    })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "results": [0, 5, 10] }))
+    );
+    assert_eq!(
+        fetch_checkpoints(&queue, spawned.task_id).await?,
+        vec![
+            ("manual-loop".to_string(), json!(0)),
+            ("manual-loop#2".to_string(), json!(5)),
+            ("manual-loop#3".to_string(), json!(10)),
+        ]
     );
 
     client.drop_queue().await?;
@@ -890,6 +1349,99 @@ async fn failed_step_is_not_checkpointed_and_reexecutes() -> Result<()> {
     let task = fetch_task(&queue, spawned.task_id).await?;
     assert_eq!(task.state, "completed");
     assert_eq!(task.completed_payload, Some(json!({ "result": "success" })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn multi_step_only_reexecutes_uncompleted_steps() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let third_calls = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("multi-step-retry")
+        .queue(&queue)
+        .default_max_attempts(2);
+    client.register(&task, {
+        let first_calls = Arc::clone(&first_calls);
+        let second_calls = Arc::clone(&second_calls);
+        let third_calls = Arc::clone(&third_calls);
+        move |(), mut ctx| {
+            let first_calls = Arc::clone(&first_calls);
+            let second_calls = Arc::clone(&second_calls);
+            let third_calls = Arc::clone(&third_calls);
+            async move {
+                let first: i64 = ctx
+                    .step("first", || {
+                        let first_calls = Arc::clone(&first_calls);
+                        async move {
+                            first_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(1)
+                        }
+                    })
+                    .await?;
+                let second: i64 = ctx
+                    .step("second", || {
+                        let second_calls = Arc::clone(&second_calls);
+                        async move {
+                            second_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(2)
+                        }
+                    })
+                    .await?;
+                let third: i64 = ctx
+                    .step("third", || {
+                        let third_calls = Arc::clone(&third_calls);
+                        async move {
+                            let call = third_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                            if call == 1 {
+                                Err(Error::message("third step fails once"))
+                            } else {
+                                Ok(3)
+                            }
+                        }
+                    })
+                    .await?;
+                Ok(json!({
+                    "sum": first + second + third,
+                    "first_calls": first_calls.load(Ordering::SeqCst),
+                    "second_calls": second_calls.load(Ordering::SeqCst),
+                    "third_calls": third_calls.load(Ordering::SeqCst),
+                }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(third_calls.load(Ordering::SeqCst), 2);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({
+            "sum": 6,
+            "first_calls": 1,
+            "second_calls": 1,
+            "third_calls": 2,
+        }))
+    );
+    assert_eq!(
+        fetch_checkpoints(&queue, spawned.task_id).await?,
+        vec![
+            ("first".to_string(), json!(1)),
+            ("second".to_string(), json!(2)),
+            ("third".to_string(), json!(3)),
+        ]
+    );
 
     client.drop_queue().await?;
     Ok(())
@@ -1017,6 +1569,45 @@ async fn pre_emitted_event_is_available_to_late_waiter() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn event_emit_is_first_write_wins() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let event_name = format!("first_write_{queue}");
+
+    client
+        .emit_event(&event_name, &json!({ "version": 1 }), None)
+        .await?;
+    client
+        .emit_event(&event_name, &json!({ "version": 2 }), None)
+        .await?;
+
+    let task = Task::<(), Value>::new("first-write-waiter").queue(&queue);
+    client.register(&task, {
+        let event_name = event_name.clone();
+        move |(), mut ctx| {
+            let event_name = event_name.clone();
+            async move {
+                let received: Value = ctx.await_event(&event_name).await?;
+                Ok(json!({ "received": received }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "received": { "version": 1 } }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn emitted_event_wakes_all_waiters() -> Result<()> {
     let (queue, client) = test_client().await?;
     let event_name = format!("broadcast_{queue}");
@@ -1127,6 +1718,48 @@ async fn event_timeout_can_be_caught_without_recreating_wait() -> Result<()> {
         task.completed_payload,
         Some(json!({ "timed_out": true, "second_payload": null }))
     );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn cleanup_removes_terminal_tasks_and_events_by_ttl() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-03-01T08:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+
+    let task = Task::<(), Value>::new("cleanup-target").queue(&queue);
+    client.register(
+        &task,
+        |(), _ctx| async move { Ok(json!({ "status": "done" })) },
+    )?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    client
+        .emit_event("cleanup-event", &json!({ "kind": "notify" }), None)
+        .await?;
+
+    set_fake_now(&pool, Some(base + ChronoDuration::minutes(30))).await?;
+    let before_ttl = client.cleanup(Duration::from_secs(3600), None).await?;
+    assert_eq!(before_ttl.tasks_deleted, 0);
+    assert_eq!(before_ttl.events_deleted, 0);
+    assert_eq!(
+        fetch_task(&queue, spawned.task_id).await?.state,
+        "completed"
+    );
+    assert_eq!(count_events(&queue).await?, 1);
+
+    set_fake_now(&pool, Some(base + ChronoDuration::hours(2))).await?;
+    let cleanup = client
+        .cleanup_with_limit(Duration::from_secs(3600), 10, None)
+        .await?;
+    assert_eq!(cleanup.tasks_deleted, 1);
+    assert_eq!(cleanup.events_deleted, 1);
+    assert_eq!(count_tasks(&queue).await?, 0);
+    assert_eq!(count_events(&queue).await?, 0);
 
     client.drop_queue().await?;
     Ok(())
@@ -1415,7 +2048,9 @@ async fn retry_task_can_spawn_new_task_from_original_inputs() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn fixed_retry_strategy_delays_next_attempt() -> Result<()> {
-    let (queue, client) = test_client().await?;
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-01T11:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
     let attempts = Arc::new(AtomicUsize::new(0));
 
     let task = Task::<(), Value>::new("fixed-retry")
@@ -1453,7 +2088,7 @@ async fn fixed_retry_strategy_delays_next_attempt() -> Result<()> {
     assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    set_fake_now(&pool, Some(base + ChronoDuration::seconds(1))).await?;
     assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
 
     let task = fetch_task(&queue, spawned.task_id).await?;
@@ -1461,6 +2096,218 @@ async fn fixed_retry_strategy_delays_next_attempt() -> Result<()> {
     assert_eq!(task.attempts, 2);
     assert_eq!(task.completed_payload, Some(json!({ "attempts": 2 })));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn retry_strategy_none_requeues_immediately() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-01T12:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("none-retry")
+        .queue(&queue)
+        .default_max_attempts(2);
+    client.register(&task, {
+        let attempts = Arc::clone(&attempts);
+        move |(), _ctx| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    Err(Error::message("retry immediately"))
+                } else {
+                    Ok(json!({ "attempts": attempt }))
+                }
+            }
+        }
+    })?;
+
+    let spawned = client
+        .spawn(
+            &task,
+            (),
+            SpawnOptions::new().retry_strategy(RetryStrategy::none()),
+        )
+        .await?;
+    let metadata = fetch_task_spawn_metadata(&queue, spawned.task_id).await?;
+    assert_eq!(metadata.retry_strategy, Some(json!({ "kind": "none" })));
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "pending");
+    assert_eq!(task.attempts, 2);
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(task.completed_payload, Some(json!({ "attempts": 2 })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn exponential_retry_strategy_delays_attempts() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-01T10:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("exponential-retry")
+        .queue(&queue)
+        .default_max_attempts(3);
+    client.register(&task, {
+        let attempts = Arc::clone(&attempts);
+        move |(), _ctx| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt < 3 {
+                    Err(Error::message(format!("fail-{attempt}")))
+                } else {
+                    Ok(json!({ "attempts": attempt }))
+                }
+            }
+        }
+    })?;
+
+    let spawned = client
+        .spawn(
+            &task,
+            (),
+            SpawnOptions::new().retry_strategy(
+                RetryStrategy::exponential(Duration::from_secs(1), 3.0)
+                    .with_max(Duration::from_secs(2)),
+            ),
+        )
+        .await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "sleeping");
+    assert_eq!(task.attempts, 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+
+    set_fake_now(&pool, Some(base + ChronoDuration::seconds(1))).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "sleeping");
+    assert_eq!(task.attempts, 3);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+
+    set_fake_now(&pool, Some(base + ChronoDuration::seconds(3))).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(task.attempts, 3);
+    assert_eq!(task.completed_payload, Some(json!({ "attempts": 3 })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn cancellation_policy_cancels_by_max_delay() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-01T08:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+
+    let task = Task::<(), Value>::new("max-delay-cancel").queue(&queue);
+    client.register(&task, |(), _ctx| async move {
+        Ok(json!({ "unexpected": true }))
+    })?;
+
+    let spawned = client
+        .spawn(
+            &task,
+            (),
+            SpawnOptions::new()
+                .cancellation(CancellationPolicy::new().max_delay(Duration::from_secs(60))),
+        )
+        .await?;
+
+    set_fake_now(&pool, Some(base + ChronoDuration::seconds(61))).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "cancelled");
+    assert!(task.cancelled_at.is_some());
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn cancellation_policy_cancels_by_max_duration() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-01T09:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+
+    let task = Task::<(), Value>::new("max-duration-cancel")
+        .queue(&queue)
+        .default_max_attempts(3);
+    client.register(&task, |(), _ctx| async move {
+        Err::<Value, Error>(Error::message("fail until duration cancellation"))
+    })?;
+
+    let spawned = client
+        .spawn(
+            &task,
+            (),
+            SpawnOptions::new()
+                .retry_strategy(RetryStrategy::fixed(Duration::from_secs(30)))
+                .cancellation(CancellationPolicy::new().max_duration(Duration::from_secs(90))),
+        )
+        .await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "sleeping");
+    assert_eq!(count_runs(&queue, spawned.task_id).await?, 2);
+
+    set_fake_now(&pool, Some(base + ChronoDuration::seconds(91))).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "cancelled");
+    assert!(task.cancelled_at.is_some());
+    assert_eq!(count_runs(&queue, spawned.task_id).await?, 2);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn default_task_cancellation_is_applied() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-01T08:30:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+
+    let task = Task::<(), Value>::new("default-cancel")
+        .queue(&queue)
+        .default_cancellation(CancellationPolicy::new().max_delay(Duration::from_secs(60)));
+    client.register(&task, |(), _ctx| async move {
+        Ok(json!({ "unexpected": true }))
+    })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    let metadata = fetch_task_spawn_metadata(&queue, spawned.task_id).await?;
+    assert_eq!(metadata.cancellation, Some(json!({ "max_delay": 60 })));
+
+    set_fake_now(&pool, Some(base + ChronoDuration::seconds(61))).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "cancelled");
+    assert!(task.cancelled_at.is_some());
 
     client.drop_queue().await?;
     Ok(())
@@ -1587,6 +2434,109 @@ async fn manual_cancel_pending_task_prevents_claim() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn manual_cancel_running_sleeping_terminal_and_missing_cases() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let running_started = Arc::new(Notify::new());
+    let running_release = Arc::new(Notify::new());
+    let running_task = Task::<(), Value>::new("running-cancel").queue(&queue);
+    client.register(&running_task, {
+        let running_started = Arc::clone(&running_started);
+        let running_release = Arc::clone(&running_release);
+        move |(), _ctx| {
+            let running_started = Arc::clone(&running_started);
+            let running_release = Arc::clone(&running_release);
+            async move {
+                running_started.notify_one();
+                running_release.notified().await;
+                Ok(json!({ "would_complete": true }))
+            }
+        }
+    })?;
+
+    let running = client.spawn(&running_task, (), SpawnOptions::new()).await?;
+    let worker = client.start_worker(
+        WorkerOptions::new()
+            .poll_interval(Duration::from_millis(25))
+            .fatal_on_lease_timeout(false),
+    )?;
+    tokio::time::timeout(Duration::from_secs(5), running_started.notified())
+        .await
+        .map_err(|_| Error::message("running cancel task did not start"))?;
+    client.cancel_task(running.task_id, None).await?;
+    running_release.notify_one();
+    worker.close().await?;
+    let running_row = fetch_task(&queue, running.task_id).await?;
+    assert_eq!(running_row.state, "cancelled");
+    assert!(running_row.cancelled_at.is_some());
+
+    let sleeping_event = format!("sleeping_cancel_{queue}");
+    let sleeping_task = Task::<(), Value>::new("sleeping-cancel").queue(&queue);
+    client.register(&sleeping_task, {
+        let sleeping_event = sleeping_event.clone();
+        move |(), mut ctx| {
+            let sleeping_event = sleeping_event.clone();
+            async move {
+                let payload: Value = ctx.await_event(&sleeping_event).await?;
+                Ok(json!({ "payload": payload }))
+            }
+        }
+    })?;
+    let sleeping = client
+        .spawn(&sleeping_task, (), SpawnOptions::new())
+        .await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(
+        fetch_task(&queue, sleeping.task_id).await?.state,
+        "sleeping"
+    );
+    client.cancel_task(sleeping.task_id, None).await?;
+    let sleeping_row = fetch_task(&queue, sleeping.task_id).await?;
+    assert_eq!(sleeping_row.state, "cancelled");
+    assert!(sleeping_row.cancelled_at.is_some());
+    client
+        .emit_event(&sleeping_event, &json!({ "ignored": true }), None)
+        .await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
+
+    let completed_task = Task::<(), Value>::new("completed-cancel-noop").queue(&queue);
+    client.register(&completed_task, |(), _ctx| async move {
+        Ok(json!({ "done": true }))
+    })?;
+    let completed = client
+        .spawn(&completed_task, (), SpawnOptions::new())
+        .await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    client.cancel_task(completed.task_id, None).await?;
+    let completed_row = fetch_task(&queue, completed.task_id).await?;
+    assert_eq!(completed_row.state, "completed");
+    assert!(completed_row.cancelled_at.is_none());
+
+    let failed_task = Task::<(), Value>::new("failed-cancel-noop")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&failed_task, |(), _ctx| async move {
+        Err::<Value, Error>(Error::message("terminal failure"))
+    })?;
+    let failed = client.spawn(&failed_task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    client.cancel_task(failed.task_id, None).await?;
+    let failed_row = fetch_task(&queue, failed.task_id).await?;
+    assert_eq!(failed_row.state, "failed");
+    assert!(failed_row.cancelled_at.is_none());
+
+    let missing_task_id = uuid::Uuid::new_v4();
+    let missing = client.cancel_task(missing_task_id, None).await;
+    assert!(
+        matches!(missing, Err(Error::Database(err)) if format!("{err:?}").contains("not found"))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn cancelled_terminal_race_does_not_record_task_failure() -> Result<()> {
     let (queue, client) = test_client().await?;
 
@@ -1687,6 +2637,17 @@ async fn fetch_task(queue: &str, task_id: uuid::Uuid) -> Result<TaskRow> {
     })
 }
 
+async fn fetch_task_spawn_metadata(queue: &str, task_id: uuid::Uuid) -> Result<TaskSpawnMetadata> {
+    let pg = pg_client().await?;
+    let query =
+        format!("SELECT retry_strategy, cancellation FROM absurd.t_{queue} WHERE task_id = $1");
+    let row = pg.query_one(&query, &[&task_id]).await?;
+    Ok(TaskSpawnMetadata {
+        retry_strategy: row.get(0),
+        cancellation: row.get(1),
+    })
+}
+
 async fn fetch_run(queue: &str, run_id: uuid::Uuid) -> Result<RunRow> {
     let pg = pg_client().await?;
     let query = format!(
@@ -1723,6 +2684,12 @@ async fn set_task_headers(queue: &str, task_id: uuid::Uuid, headers: Value) -> R
 async fn count_tasks(queue: &str) -> Result<i64> {
     let pg = pg_client().await?;
     let query = format!("SELECT count(*) FROM absurd.t_{queue}");
+    Ok(pg.query_one(&query, &[]).await?.get(0))
+}
+
+async fn count_events(queue: &str) -> Result<i64> {
+    let pg = pg_client().await?;
+    let query = format!("SELECT count(*) FROM absurd.e_{queue}");
     Ok(pg.query_one(&query, &[]).await?.get(0))
 }
 

@@ -716,20 +716,27 @@ pub(crate) async fn claim_tasks(
 }
 
 fn resolve_database_url(explicit: Option<&str>) -> String {
+    resolve_database_url_with(explicit, |key| std::env::var(key).ok())
+}
+
+fn resolve_database_url_with<F>(explicit: Option<&str>, mut env: F) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
     if let Some(explicit) = explicit.filter(|value| !value.trim().is_empty()) {
         return explicit.to_string();
     }
-    if let Ok(url) = std::env::var("ABSURD_DATABASE_URL") {
+    if let Some(url) = env("ABSURD_DATABASE_URL") {
         if !url.trim().is_empty() {
             return url;
         }
     }
-    if let Ok(url) = std::env::var("DATABASE_URL") {
+    if let Some(url) = env("DATABASE_URL") {
         if !url.trim().is_empty() {
             return url;
         }
     }
-    if let Ok(pgdatabase) = std::env::var("PGDATABASE") {
+    if let Some(pgdatabase) = env("PGDATABASE") {
         if !pgdatabase.trim().is_empty() {
             if pgdatabase.contains("://") || pgdatabase.contains('=') {
                 return pgdatabase;
@@ -738,4 +745,67 @@ fn resolve_database_url(explicit: Option<&str>) -> String {
         }
     }
     "postgresql://localhost/absurd".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn connection_defaults_resolve_env_precedence() {
+        let env = HashMap::from([
+            ("ABSURD_DATABASE_URL", "postgresql://localhost/absurd_env"),
+            ("DATABASE_URL", "postgresql://localhost/database_env"),
+            ("PGDATABASE", "pg_database_name"),
+        ]);
+
+        assert_eq!(
+            resolve_database_url_with(Some("postgresql://explicit/database"), |key| env
+                .get(key)
+                .map(ToString::to_string)),
+            "postgresql://explicit/database"
+        );
+        assert_eq!(
+            resolve_database_url_with(Some("   "), |key| env.get(key).map(ToString::to_string)),
+            "postgresql://localhost/absurd_env"
+        );
+        assert_eq!(
+            resolve_database_url_with(None, |key| env.get(key).map(ToString::to_string)),
+            "postgresql://localhost/absurd_env"
+        );
+
+        let env_without_absurd = HashMap::from([
+            ("DATABASE_URL", "postgresql://localhost/database_env"),
+            ("PGDATABASE", "pg_database_name"),
+        ]);
+        assert_eq!(
+            resolve_database_url_with(None, |key| env_without_absurd
+                .get(key)
+                .map(ToString::to_string)),
+            "postgresql://localhost/database_env"
+        );
+
+        let env_with_plain_pgdatabase = HashMap::from([("PGDATABASE", "pg_database_name")]);
+        assert_eq!(
+            resolve_database_url_with(None, |key| env_with_plain_pgdatabase
+                .get(key)
+                .map(ToString::to_string)),
+            "dbname=pg_database_name"
+        );
+
+        let env_with_pgdatabase_url = HashMap::from([("PGDATABASE", "postgresql://localhost/pg")]);
+        assert_eq!(
+            resolve_database_url_with(None, |key| env_with_pgdatabase_url
+                .get(key)
+                .map(ToString::to_string)),
+            "postgresql://localhost/pg"
+        );
+
+        let empty_env = HashMap::<&str, &str>::new();
+        assert_eq!(
+            resolve_database_url_with(None, |key| empty_env.get(key).map(ToString::to_string)),
+            "postgresql://localhost/absurd"
+        );
+    }
 }
