@@ -1,0 +1,2 @@
+[alias]
+test-db = "test --test integration --all-features -- --ignored --test-threads=1"

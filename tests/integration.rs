@@ -1,14 +1,24 @@
+//! Database integration tests for the Absurd Rust SDK.
+//!
+//! These tests are ignored by default because they require Postgres initialized
+//! with Absurd SQL. Run them locally with `ABSURD_DATABASE_URL=... cargo test-db`.
+
 use absurd_rust_sdk::{
-    AwaitEventOptions, Client, Error, Result, RetryStrategy, SpawnOptions, Task, WorkBatchOptions,
+    AwaitEventOptions, AwaitTaskResultOptions, Client, CreateQueueOptions, Error, Hooks,
+    QueueDetachMode, QueuePolicyOptions, QueueStorageMode, Result, RetryStrategy, RetryTaskOptions,
+    SpawnOptions, Task, TaskResultSnapshot, UnknownTaskPolicy, WorkBatchOptions, WorkerErrorKind,
+    WorkerOptions,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Params {
@@ -24,6 +34,7 @@ struct Output {
 struct TaskRow {
     state: String,
     attempts: i32,
+    max_attempts: Option<i32>,
     completed_payload: Option<Value>,
     cancelled_at: Option<DateTime<Utc>>,
 }
@@ -72,6 +83,92 @@ async fn queue_create_list_drop_round_trip() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn partitioned_queue_create_round_trip() -> Result<()> {
+    let queue = random_queue();
+    let client = Client::connect_queue(database_url(), &queue).await?;
+
+    client
+        .create_queue_with_options(
+            CreateQueueOptions::new().storage_mode(QueueStorageMode::Partitioned),
+        )
+        .await?;
+    assert!(client.list_queues().await?.contains(&queue));
+
+    let relkinds = queue_relation_kinds(&queue).await?;
+    for prefix in ["t", "r", "c", "w"] {
+        assert_eq!(
+            relkinds
+                .get(&format!("{prefix}_{queue}"))
+                .map(String::as_str),
+            Some("p")
+        );
+    }
+    for prefix in ["e", "i"] {
+        assert_eq!(
+            relkinds
+                .get(&format!("{prefix}_{queue}"))
+                .map(String::as_str),
+            Some("r")
+        );
+    }
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn queue_policy_round_trip() -> Result<()> {
+    let queue = random_queue();
+    let client = Client::connect_queue(database_url(), &queue).await?;
+
+    client
+        .create_queue_with_options(
+            CreateQueueOptions::new()
+                .storage_mode(QueueStorageMode::Partitioned)
+                .partition_lookahead("35 days")
+                .partition_lookback("2 days")
+                .cleanup_ttl("12345 seconds")
+                .cleanup_limit(77)
+                .detach_mode(QueueDetachMode::Empty)
+                .detach_min_age("45 days"),
+        )
+        .await?;
+
+    let policy = client
+        .get_queue_policy()
+        .await?
+        .ok_or_else(|| Error::message("expected queue policy"))?;
+    assert_eq!(policy.queue_name, queue);
+    assert_eq!(policy.storage_mode, QueueStorageMode::Partitioned);
+    assert_eq!(policy.partition_lookahead, "35 days");
+    assert_eq!(policy.partition_lookback, "2 days");
+    assert!(policy.cleanup_ttl.ends_with("3:25:45"));
+    assert_eq!(policy.cleanup_limit, 77);
+    assert_eq!(policy.detach_mode, QueueDetachMode::Empty);
+    assert_eq!(policy.detach_min_age, "45 days");
+
+    client
+        .set_queue_policy(
+            QueuePolicyOptions::new()
+                .cleanup_ttl("4321 seconds")
+                .cleanup_limit(12),
+        )
+        .await?;
+
+    let updated = client
+        .get_queue_policy()
+        .await?
+        .ok_or_else(|| Error::message("expected updated queue policy"))?;
+    assert!(updated.cleanup_ttl.ends_with("1:12:01"));
+    assert_eq!(updated.cleanup_limit, 12);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn basic_typed_task_round_trip() -> Result<()> {
     let (queue, client) = test_client().await?;
 
@@ -96,6 +193,593 @@ async fn basic_typed_task_round_trip() -> Result<()> {
     let task = fetch_task(&queue, spawned.task_id).await?;
     assert_eq!(task.state, "completed");
     assert_eq!(task.completed_payload, Some(json!({ "doubled": 42 })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn worker_close_waits_for_running_tasks() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let task = Task::<(), Value>::new("draining-task").queue(&queue);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    client.register(&task, {
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        let completed = Arc::clone(&completed);
+        move |(), _ctx| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let completed = Arc::clone(&completed);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "drained": true }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+    let worker = client.start_worker(
+        WorkerOptions::new()
+            .poll_interval(Duration::from_millis(25))
+            .fatal_on_lease_timeout(false),
+    )?;
+
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .map_err(|_| Error::message("worker did not start task"))?;
+
+    let close = tokio::spawn(worker.close());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!close.is_finished());
+
+    release.notify_one();
+    let close_result = close.await.map_err(Error::Join)?;
+    close_result?;
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(task.completed_payload, Some(json!({ "drained": true })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn worker_on_error_reports_claim_failures() -> Result<()> {
+    let (_queue, client) = test_client().await?;
+    let (error_tx, mut error_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let worker = client.start_worker(
+        WorkerOptions::new()
+            .poll_interval(Duration::from_millis(25))
+            .fatal_on_lease_timeout(false)
+            .on_error(move |worker_error| {
+                if worker_error.kind == WorkerErrorKind::Claim {
+                    let _ = error_tx.send(worker_error.error.to_string());
+                }
+            }),
+    )?;
+
+    client.drop_queue().await?;
+
+    let message = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
+        .await
+        .map_err(|_| Error::message("worker did not report claim error"))?
+        .ok_or_else(|| Error::message("worker error channel closed"))?;
+    assert!(!message.is_empty());
+
+    worker.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn worker_on_error_reports_execution_failures() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let (error_tx, mut error_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let task = Task::<(), Value>::new("worker-execution-error")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, |(), _ctx| async move {
+        Err::<Value, Error>(Error::message("handler execution failed"))
+    })?;
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+
+    let worker = client.start_worker(
+        WorkerOptions::new()
+            .poll_interval(Duration::from_millis(25))
+            .fatal_on_lease_timeout(false)
+            .on_error(move |worker_error| {
+                if worker_error.kind == WorkerErrorKind::Execution {
+                    let _ = error_tx.send(worker_error.error.to_string());
+                }
+            }),
+    )?;
+
+    let message = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
+        .await
+        .map_err(|_| Error::message("worker did not report execution error"))?
+        .ok_or_else(|| Error::message("worker error channel closed"))?;
+    assert_eq!(message, "handler execution failed");
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(run.state, "failed");
+    assert_eq!(
+        run.failure_reason,
+        Some(json!({
+            "name": "Error",
+            "message": "handler execution failed",
+            "debug": "Message(\"handler execution failed\")",
+            "traceback": null,
+        }))
+    );
+
+    worker.close().await?;
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn invalid_task_headers_fail_task_and_report_execution_error() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let (error_tx, mut error_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let task = Task::<(), Value>::new("invalid-headers")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, |(), _ctx| async move {
+        Ok(json!({ "unexpected": true }))
+    })?;
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    set_task_headers(&queue, spawned.task_id, json!(["not", "an", "object"])).await?;
+
+    let worker = client.start_worker(
+        WorkerOptions::new()
+            .poll_interval(Duration::from_millis(25))
+            .fatal_on_lease_timeout(false)
+            .on_error(move |worker_error| {
+                if worker_error.kind == WorkerErrorKind::Execution {
+                    let _ = error_tx.send(worker_error.error.to_string());
+                }
+            }),
+    )?;
+
+    let message = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
+        .await
+        .map_err(|_| Error::message("worker did not report invalid headers"))?
+        .ok_or_else(|| Error::message("worker error channel closed"))?;
+    assert_eq!(message, "invalid task headers: expected a JSON object");
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(run.state, "failed");
+    assert_eq!(
+        run.failure_reason,
+        Some(json!({
+            "name": "InvalidHeaders",
+            "message": "invalid task headers: expected a JSON object",
+            "debug": "InvalidHeaders",
+            "traceback": null,
+        }))
+    );
+
+    worker.close().await?;
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn spawn_headers_are_available_to_task_context() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("headers").queue(&queue);
+    client.register(&task, |(), ctx| async move {
+        Ok(json!({ "headers": ctx.headers().clone() }))
+    })?;
+
+    let mut headers = Map::new();
+    headers.insert("trace_id".to_string(), json!("trace-123"));
+    headers.insert("sampled".to_string(), json!(true));
+
+    let spawned = client
+        .spawn(&task, (), SpawnOptions::new().headers(headers.clone()))
+        .await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "headers": Value::Object(headers) }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn before_spawn_hook_can_inject_headers() -> Result<()> {
+    let queue = random_queue();
+    let hooks = Hooks::new().before_spawn(|task_name, params, mut options| async move {
+        assert_eq!(task_name, "hooked-headers");
+        assert_eq!(params["user_id"], json!(42));
+        options
+            .headers
+            .get_or_insert_with(Map::new)
+            .insert("trace_id".to_string(), json!("trace-hook"));
+        Ok(options)
+    });
+    let client = Client::connect_queue_with_hooks(database_url(), &queue, hooks).await?;
+    client.create_queue().await?;
+
+    let task = Task::<Value, Value>::new("hooked-headers").queue(&queue);
+    client.register(&task, |_, ctx| async move {
+        Ok(json!({ "trace_id": ctx.headers().get("trace_id") }))
+    })?;
+
+    let spawned = client
+        .spawn(&task, json!({ "user_id": 42 }), SpawnOptions::new())
+        .await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "trace_id": "trace-hook" }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn wrap_task_execution_hook_can_transform_result() -> Result<()> {
+    let queue = random_queue();
+    let hooks = Hooks::new().wrap_task_execution(|ctx, execute| async move {
+        let value = execute(ctx).await?;
+        Ok(json!({ "wrapped": value }))
+    });
+    let client = Client::connect_queue_with_hooks(database_url(), &queue, hooks).await?;
+    client.create_queue().await?;
+
+    let task = Task::<(), Value>::new("wrapped-task").queue(&queue);
+    client.register(&task, |(), _ctx| async move { Ok(json!({ "ok": true })) })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "wrapped": { "ok": true } }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn task_result_fetch_and_await_return_terminal_payload() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("result-source").queue(&queue);
+    client.register(&task, |(), _ctx| async move { Ok(json!({ "answer": 42 })) })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(
+        client.fetch_task_result(spawned.task_id, None).await?,
+        Some(TaskResultSnapshot::Pending)
+    );
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let expected = TaskResultSnapshot::Completed {
+        result: json!({ "answer": 42 }),
+    };
+    assert_eq!(
+        client.fetch_task_result(spawned.task_id, None).await?,
+        Some(expected.clone())
+    );
+    assert_eq!(
+        client
+            .await_task_result(
+                spawned.task_id,
+                AwaitTaskResultOptions::new().timeout(Duration::from_secs(1)),
+            )
+            .await?,
+        expected
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn task_result_fetch_reports_failed_cancelled_and_missing_tasks() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let failing_task = Task::<(), Value>::new("result-fails")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&failing_task, |(), _ctx| async move {
+        Err::<Value, Error>(Error::message("task result failure"))
+    })?;
+
+    let failed = client.spawn(&failing_task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(
+        client.fetch_task_result(failed.task_id, None).await?,
+        Some(TaskResultSnapshot::Failed {
+            failure: json!({
+                "name": "Error",
+                "message": "task result failure",
+                "debug": "Message(\"task result failure\")",
+                "traceback": null,
+            })
+        })
+    );
+
+    let cancelled_task = Task::<(), Value>::new("result-cancelled").queue(&queue);
+    client.register(&cancelled_task, |(), _ctx| async move {
+        Ok(json!({ "unexpected": true }))
+    })?;
+    let cancelled = client
+        .spawn(&cancelled_task, (), SpawnOptions::new())
+        .await?;
+    client.cancel_task(cancelled.task_id, None).await?;
+    assert_eq!(
+        client.fetch_task_result(cancelled.task_id, None).await?,
+        Some(TaskResultSnapshot::Cancelled)
+    );
+
+    let missing_task_id = uuid::Uuid::new_v4();
+    assert_eq!(client.fetch_task_result(missing_task_id, None).await?, None);
+    let missing = client
+        .await_task_result(
+            missing_task_id,
+            AwaitTaskResultOptions::new().timeout(Duration::ZERO),
+        )
+        .await;
+    assert!(matches!(missing, Err(Error::TaskNotFound { task_id }) if task_id == missing_task_id));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn task_result_await_times_out_for_pending_task() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("result-timeout").queue(&queue);
+    client.register(&task, |(), _ctx| async move { Ok(json!({ "done": true })) })?;
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+
+    let result = client
+        .await_task_result(
+            spawned.task_id,
+            AwaitTaskResultOptions::new().timeout(Duration::ZERO),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::TaskResultTimeout { task_id }) if task_id == spawned.task_id)
+    );
+    assert_eq!(
+        client.fetch_task_result(spawned.task_id, None).await?,
+        Some(TaskResultSnapshot::Pending)
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn context_rejects_same_queue_task_result_waits() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<uuid::Uuid, Value>::new("same-queue-await-result").queue(&queue);
+    client.register(&task, |task_id, mut ctx| async move {
+        let message = match ctx
+            .await_task_result(task_id, AwaitTaskResultOptions::new())
+            .await
+        {
+            Err(Error::Config(message)) => message,
+            Ok(snapshot) => {
+                return Err(Error::message(format!(
+                    "unexpected same-queue snapshot: {snapshot:?}"
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+        Ok(json!({ "error": message }))
+    })?;
+
+    let target_id = uuid::Uuid::new_v4();
+    let spawned = client.spawn(&task, target_id, SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({
+            "error": "TaskContext.await_task_result cannot wait on tasks in the same queue because this can deadlock workers. Spawn the child in a different queue and pass options.queue."
+        }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn context_can_await_completed_task_result_from_another_queue() -> Result<()> {
+    let parent_queue = random_queue();
+    let child_queue = random_queue();
+    let parent = Client::connect_queue(database_url(), &parent_queue).await?;
+    let child = Client::connect_queue(database_url(), &child_queue).await?;
+    parent.create_queue().await?;
+    child.create_queue().await?;
+
+    let child_task = Task::<(), Value>::new("child-result").queue(&child_queue);
+    child.register(&child_task, |(), _ctx| async move {
+        Ok(json!({ "child": "done" }))
+    })?;
+    let child_spawned = child.spawn(&child_task, (), SpawnOptions::new()).await?;
+    assert_eq!(child.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let parent_task = Task::<uuid::Uuid, Value>::new("parent-await-result").queue(&parent_queue);
+    parent.register(&parent_task, {
+        let child_queue = child_queue.clone();
+        move |task_id, mut ctx| {
+            let child_queue = child_queue.clone();
+            async move {
+                let snapshot = ctx
+                    .await_task_result(
+                        task_id,
+                        AwaitTaskResultOptions::new()
+                            .queue(child_queue)
+                            .timeout(Duration::from_secs(1)),
+                    )
+                    .await?;
+                Ok(json!({ "snapshot": snapshot }))
+            }
+        }
+    })?;
+
+    let parent_spawned = parent
+        .spawn(&parent_task, child_spawned.task_id, SpawnOptions::new())
+        .await?;
+    assert_eq!(parent.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&parent_queue, parent_spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({
+            "snapshot": {
+                "state": "completed",
+                "result": { "child": "done" },
+            }
+        }))
+    );
+
+    parent.drop_queue().await?;
+    child.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn decomposed_step_handle_reuses_completed_state_after_retry() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("manual-step")
+        .queue(&queue)
+        .default_max_attempts(2);
+    client.register(&task, {
+        let attempts = Arc::clone(&attempts);
+        move |(), mut ctx| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let handle = ctx.begin_step::<i64>("manual").await?;
+                let was_done = handle.done;
+                let value = ctx.complete_step(handle, 99).await?;
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    return Err(Error::message("retry after decomposed step"));
+                }
+                Ok(json!({ "value": value, "was_done": was_done }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "value": 99, "was_done": true }))
+    );
+    assert_eq!(
+        fetch_checkpoints(&queue, spawned.task_id).await?,
+        vec![("manual".to_string(), json!(99))]
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn failed_decomposed_step_is_not_checkpointed_and_reexecutes() -> Result<()> {
+    let (queue, client) = test_client().await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let task = Task::<(), Value>::new("manual-fragile-step")
+        .queue(&queue)
+        .default_max_attempts(2);
+    client.register(&task, {
+        let attempts = Arc::clone(&attempts);
+        move |(), mut ctx| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                let handle = ctx.begin_step::<i64>("manual-fragile").await?;
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    return Err(Error::message("decomposed step failed before complete"));
+                }
+                let value = ctx.complete_step(handle, 123).await?;
+                Ok(json!({ "value": value, "attempt": attempt }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(fetch_checkpoints(&queue, spawned.task_id).await?.is_empty());
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(
+        task.completed_payload,
+        Some(json!({ "value": 123, "attempt": 2 }))
+    );
+    assert_eq!(
+        fetch_checkpoints(&queue, spawned.task_id).await?,
+        vec![("manual-fragile".to_string(), json!(123))]
+    );
 
     client.drop_queue().await?;
     Ok(())
@@ -198,6 +882,7 @@ async fn failed_step_is_not_checkpointed_and_reexecutes() -> Result<()> {
 
     assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert!(fetch_checkpoints(&queue, spawned.task_id).await?.is_empty());
 
     assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
     assert_eq!(invocations.load(Ordering::SeqCst), 2);
@@ -276,6 +961,7 @@ async fn sleep_until_suspends_then_resumes_from_checkpoint() -> Result<()> {
     assert_eq!(task.state, "sleeping");
     assert_eq!(run.state, "sleeping");
     assert!(run.wake_event.is_none());
+    assert!(run.failure_reason.is_none());
 
     let checkpoints = fetch_checkpoints(&queue, spawned.task_id).await?;
     assert_eq!(checkpoints.len(), 1);
@@ -535,6 +1221,199 @@ async fn failed_task_retries_immediately_until_success() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn retry_task_defaults_to_one_additional_attempt() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("manual-retry-default")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, |(), _ctx| async move {
+        Err::<Value, Error>(Error::message("always fails"))
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(task.attempts, 1);
+
+    let retried = client
+        .retry_task(spawned.task_id, RetryTaskOptions::new())
+        .await?;
+
+    assert_eq!(retried.task_id, spawned.task_id);
+    assert_ne!(retried.run_id, spawned.run_id);
+    assert_eq!(retried.attempt, 2);
+    assert!(!retried.created);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "pending");
+    assert_eq!(task.attempts, 2);
+    assert_eq!(task.max_attempts, Some(2));
+    assert_eq!(count_runs(&queue, spawned.task_id).await?, 2);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn retry_task_max_attempt_override_preserves_checkpoints() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("manual-retry-max-attempts")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, |(), mut ctx| async move {
+        let value: i64 = ctx.step("preserved", || async move { Ok(7) }).await?;
+        Err::<Value, Error>(Error::message(format!("failed after checkpoint {value}")))
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let failed = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(failed.state, "failed");
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(failed.max_attempts, Some(1));
+    assert_eq!(
+        fetch_checkpoints(&queue, spawned.task_id).await?,
+        vec![("preserved".to_string(), json!(7))]
+    );
+
+    let retried = client
+        .retry_task(spawned.task_id, RetryTaskOptions::new().max_attempts(3))
+        .await?;
+
+    assert_eq!(retried.task_id, spawned.task_id);
+    assert_ne!(retried.run_id, spawned.run_id);
+    assert_eq!(retried.attempt, 2);
+    assert!(!retried.created);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "pending");
+    assert_eq!(task.attempts, 2);
+    assert_eq!(task.max_attempts, Some(3));
+    assert_eq!(count_runs(&queue, spawned.task_id).await?, 2);
+    assert_eq!(
+        fetch_checkpoints(&queue, spawned.task_id).await?,
+        vec![("preserved".to_string(), json!(7))]
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn retry_task_rejects_missing_and_non_failed_tasks() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let missing_task_id = uuid::Uuid::new_v4();
+    let missing = client
+        .retry_task(missing_task_id, RetryTaskOptions::new())
+        .await;
+    let missing_error = match missing {
+        Err(Error::Database(err)) => format!("{err:?}"),
+        Ok(_) => {
+            return Err(Error::message(
+                "retry_task unexpectedly accepted a missing task",
+            ));
+        }
+        Err(err) => {
+            return Err(Error::message(format!(
+                "unexpected retry_task missing error: {err}"
+            )));
+        }
+    };
+    assert!(missing_error.contains("not found"));
+
+    let task = Task::<(), Value>::new("manual-retry-not-failed").queue(&queue);
+    client.register(&task, |(), _ctx| async move { Ok(json!({ "ok": true })) })?;
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+
+    let not_failed = client
+        .retry_task(spawned.task_id, RetryTaskOptions::new())
+        .await;
+    let not_failed_error = match not_failed {
+        Err(Error::Database(err)) => format!("{err:?}"),
+        Ok(_) => {
+            return Err(Error::message(
+                "retry_task unexpectedly accepted a pending task",
+            ));
+        }
+        Err(err) => {
+            return Err(Error::message(format!(
+                "unexpected retry_task non-failed error: {err}"
+            )));
+        }
+    };
+    assert!(not_failed_error.contains("not currently failed"));
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "pending");
+    assert_eq!(task.attempts, 1);
+    assert_eq!(count_runs(&queue, spawned.task_id).await?, 1);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn retry_task_can_spawn_new_task_from_original_inputs() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<Value, Value>::new("manual-retry-spawn-new")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, |params, mut ctx| async move {
+        let params_for_step = params.clone();
+        let _: Value = ctx
+            .step("remember-input", || async move { Ok(params_for_step) })
+            .await?;
+        Err::<Value, Error>(Error::message("always fails"))
+    })?;
+
+    let spawned = client
+        .spawn(&task, json!({ "payload": 1 }), Default::default())
+        .await?;
+
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(task.attempts, 1);
+    assert_eq!(fetch_checkpoints(&queue, spawned.task_id).await?.len(), 1);
+
+    let retried = client
+        .retry_task(
+            spawned.task_id,
+            RetryTaskOptions::new().queue(&queue).spawn_new_task(),
+        )
+        .await?;
+
+    assert_ne!(retried.task_id, spawned.task_id);
+    assert_ne!(retried.run_id, spawned.run_id);
+    assert_eq!(retried.attempt, 1);
+    assert!(retried.created);
+    assert_eq!(count_tasks(&queue).await?, 2);
+
+    let old_task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(old_task.state, "failed");
+    assert_eq!(old_task.attempts, 1);
+    assert_eq!(fetch_checkpoints(&queue, spawned.task_id).await?.len(), 1);
+
+    let new_task = fetch_task(&queue, retried.task_id).await?;
+    assert_eq!(new_task.state, "pending");
+    assert_eq!(new_task.attempts, 1);
+    assert!(fetch_checkpoints(&queue, retried.task_id).await?.is_empty());
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn fixed_retry_strategy_delays_next_attempt() -> Result<()> {
     let (queue, client) = test_client().await?;
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -617,6 +1496,77 @@ async fn unknown_task_is_deferred_by_default() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn unknown_task_fail_policy_records_failure_payload() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let spawned = client
+        .spawn_named(
+            "ghost-task-fail",
+            json!({ "value": 1 }),
+            SpawnOptions::new().queue(&queue).max_attempts(1),
+        )
+        .await?;
+
+    assert_eq!(
+        client
+            .work_batch(WorkBatchOptions::new().unknown_task_policy(UnknownTaskPolicy::Fail))
+            .await?,
+        1
+    );
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(run.state, "failed");
+    assert_eq!(
+        run.failure_reason,
+        Some(json!({
+            "name": "TaskNotRegistered",
+            "message": "task \"ghost-task-fail\" is not registered",
+            "debug": "TaskNotRegistered(\"ghost-task-fail\")",
+            "traceback": null,
+        }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn panic_failure_payload_records_diagnostic_shape() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("panic-payload")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, |(), _ctx| async move {
+        std::panic::resume_unwind(Box::new(String::from("panic payload")))
+    })?;
+
+    let spawned = client.spawn(&task, (), SpawnOptions::new()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(run.state, "failed");
+    assert_eq!(
+        run.failure_reason,
+        Some(json!({
+            "name": "panic",
+            "message": "panic payload",
+            "debug": "task panicked: panic payload",
+            "traceback": null,
+        }))
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
 async fn manual_cancel_pending_task_prevents_claim() -> Result<()> {
     let (queue, client) = test_client().await?;
 
@@ -635,6 +1585,85 @@ async fn manual_cancel_pending_task_prevents_claim() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn cancelled_terminal_race_does_not_record_task_failure() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("cancel-race").queue(&queue);
+    client.register(&task, {
+        let client = client.clone();
+        move |(), ctx| {
+            let client = client.clone();
+            async move {
+                client.cancel_task(ctx.task_id(), None).await?;
+                Ok(json!({ "would_complete": true }))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "cancelled");
+    assert!(task.cancelled_at.is_some());
+    assert_eq!(run.state, "cancelled");
+    assert!(run.failure_reason.is_none());
+    assert_eq!(
+        client.fetch_task_result(spawned.task_id, None).await?,
+        Some(TaskResultSnapshot::Cancelled)
+    );
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn already_failed_terminal_race_does_not_overwrite_failure_payload() -> Result<()> {
+    let (queue, client) = test_client().await?;
+
+    let task = Task::<(), Value>::new("already-failed-race")
+        .queue(&queue)
+        .default_max_attempts(1);
+    client.register(&task, {
+        let queue = queue.clone();
+        move |(), ctx| {
+            let queue = queue.clone();
+            async move {
+                let pg = pg_client().await?;
+                let run_id = ctx.run_id();
+                let payload = json!({ "name": "ManualFailure", "message": "already failed" });
+                let retry_at: Option<DateTime<Utc>> = None;
+                pg.execute(
+                    "SELECT absurd.fail_run($1, $2, $3, $4)",
+                    &[&queue, &run_id, &payload, &retry_at],
+                )
+                .await?;
+                Err::<Value, Error>(Error::message("worker should not overwrite this failure"))
+            }
+        }
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    assert_eq!(task.state, "failed");
+    assert_eq!(run.state, "failed");
+    assert_eq!(
+        run.failure_reason,
+        Some(json!({ "name": "ManualFailure", "message": "already failed" }))
+    );
+    assert_eq!(count_runs(&queue, spawned.task_id).await?, 1);
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
 async fn pg_client() -> Result<tokio_postgres::Client> {
     let (pg, connection) = tokio_postgres::connect(&database_url(), tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
@@ -646,14 +1675,15 @@ async fn pg_client() -> Result<tokio_postgres::Client> {
 async fn fetch_task(queue: &str, task_id: uuid::Uuid) -> Result<TaskRow> {
     let pg = pg_client().await?;
     let query = format!(
-        "SELECT state, attempts, completed_payload, cancelled_at FROM absurd.t_{queue} WHERE task_id = $1"
+        "SELECT state, attempts, max_attempts, completed_payload, cancelled_at FROM absurd.t_{queue} WHERE task_id = $1"
     );
     let row = pg.query_one(&query, &[&task_id]).await?;
     Ok(TaskRow {
         state: row.get(0),
         attempts: row.get(1),
-        completed_payload: row.get(2),
-        cancelled_at: row.get(3),
+        max_attempts: row.get(2),
+        completed_payload: row.get(3),
+        cancelled_at: row.get(4),
     })
 }
 
@@ -683,10 +1713,23 @@ async fn fetch_checkpoints(queue: &str, task_id: uuid::Uuid) -> Result<Vec<(Stri
         .collect())
 }
 
+async fn set_task_headers(queue: &str, task_id: uuid::Uuid, headers: Value) -> Result<()> {
+    let pg = pg_client().await?;
+    let query = format!("UPDATE absurd.t_{queue} SET headers = $2 WHERE task_id = $1");
+    pg.execute(&query, &[&task_id, &headers]).await?;
+    Ok(())
+}
+
 async fn count_tasks(queue: &str) -> Result<i64> {
     let pg = pg_client().await?;
     let query = format!("SELECT count(*) FROM absurd.t_{queue}");
     Ok(pg.query_one(&query, &[]).await?.get(0))
+}
+
+async fn count_runs(queue: &str, task_id: uuid::Uuid) -> Result<i64> {
+    let pg = pg_client().await?;
+    let query = format!("SELECT count(*) FROM absurd.r_{queue} WHERE task_id = $1");
+    Ok(pg.query_one(&query, &[&task_id]).await?.get(0))
 }
 
 async fn queue_table_count(queue: &str) -> Result<i64> {
@@ -705,4 +1748,30 @@ async fn queue_table_count(queue: &str) -> Result<i64> {
         )
         .await?
         .get(0))
+}
+
+async fn queue_relation_kinds(queue: &str) -> Result<HashMap<String, String>> {
+    let pg = pg_client().await?;
+    let relation_names = vec![
+        format!("c_{queue}"),
+        format!("e_{queue}"),
+        format!("i_{queue}"),
+        format!("r_{queue}"),
+        format!("t_{queue}"),
+        format!("w_{queue}"),
+    ];
+    let rows = pg
+        .query(
+            "SELECT c.relname, c.relkind::text
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'absurd' AND c.relname = ANY($1::text[])",
+            &[&relation_names],
+        )
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
 }

@@ -6,20 +6,17 @@ This repository is intentionally independent from upstream while the Rust API is
 
 ## Status
 
-Experimental community SDK. Implemented today:
+Experimental community SDK with practical core parity against the Python, TypeScript, and Go SDKs for Absurd SQL `0.4.0`.
+
+Implemented:
 
 - Typed task registration and spawning with `serde` parameters and results.
 - One-shot batch execution and long-running Tokio workers.
-- Durable task context helpers for checkpointed steps, sleeps, event waits, event emission, and claim heartbeats.
-- Retry strategies, cancellation policy wiring, idempotent spawn, queue lifecycle, cleanup, and unknown-task handling.
-- Database integration tests for queue lifecycle, typed tasks, checkpointing, sleeps, events, idempotency, retries, unknown tasks, and cancellation.
+- Durable task context helpers for checkpointed steps, decomposed steps, sleeps, task-result waits, event waits, event emission, and claim heartbeats.
+- Retry strategies, retry-task helpers, cancellation policy wiring, idempotent spawn, queue lifecycle/policy, hooks, cleanup, and unknown-task handling.
+- Database integration tests for queue lifecycle, typed tasks, task results, checkpointing, sleeps, events, idempotency, retries, retry-task behavior, unknown tasks, cancellation, diagnostics, and worker safety.
 
-Still hardening:
-
-- Additional parity coverage against upstream SDK behavior.
-- Task-result polling APIs for Absurd SQL versions that expose `get_task_result`.
-- Optional spawn/execution middleware for tracing and header propagation.
-- Broader built-in TLS and pool configuration. Use `Client::from_pool` for custom pool setup today.
+See [Absurd SQL 0.4.0 SDK parity](docs/parity/absurd-sql-0.4.0.md) for the current cross-SDK parity matrix, validation target, and intentional Rust deviations.
 
 ## Goals
 
@@ -237,6 +234,41 @@ Retry, cancellation, idempotency, event wakeups, leases, and cleanup remain data
 
 A `PGDATABASE` value that is not a URL or keyword connection string is treated as a database name (`dbname=...`). Built-in URL constructors currently use `NoTls`; use `Client::from_pool` to provide a custom `deadpool_postgres::Pool`.
 
+## Connection configuration
+
+`Client::connect*` and `Client::from_env*` create a `deadpool_postgres::Pool` with `tokio_postgres::NoTls`. For production pool sizing, lifecycle, or TLS, construct the pool yourself and pass it to `Client::from_pool` or `Client::from_pool_with_hooks`:
+
+```rust
+use absurd_rust_sdk::{Client, Result};
+use deadpool_postgres::{Config, Runtime};
+use tokio_postgres::NoTls;
+
+fn client_from_pool() -> Result<Client> {
+    let mut cfg = Config::new();
+    cfg.url = Some("postgresql://localhost/absurd".to_string());
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(16));
+
+    let pool = cfg
+        .create_pool(Some(Runtime::Tokio1), NoTls)
+        .map_err(|err| absurd_rust_sdk::Error::Config(err.to_string()))?;
+
+    Client::from_pool(pool, "default")
+}
+```
+
+For TLS, build the same pool with the TLS connector required by your deployment, such as `postgres-openssl` or `postgres-native-tls`, then pass the resulting pool to `Client::from_pool`. The Rust SDK keeps TLS connector choice outside the crate so applications can select their preferred TLS stack and root configuration.
+
+## Rust parity notes
+
+Intentional Rust deviations from the TypeScript, Python, and Go SDKs:
+
+- The API is async-only and Tokio-based. Use async task handlers and Tokio runtimes instead of sync wrappers.
+- Task-local operations use an explicit `TaskContext` parameter instead of global or decorator context. Pass the context through helper functions that need steps, sleeps, events, heartbeats, or task-result waits.
+- Observability uses `tracing` and `WorkerOptions::on_error` instead of logger injection. Install a `tracing` subscriber and use `on_error` for claim/execution callback hooks.
+- Worker shutdown uses `Worker::close().await` for a graceful drain. Dropping a `Worker` requests shutdown through RAII, but explicit `close` is the durable equivalent of mandatory client/worker close calls in other SDKs.
+- Raw task claiming remains internal. `Client::work_batch` and `Worker` always dispatch through registered handlers, which preserves typed execution, hooks, control-flow sentinel handling, and failure diagnostics. Low-level `claim_task` access is intentionally not public to avoid bypassing those invariants.
+- Failure payloads persist `name`, `message`, `debug`, and `traceback`. Rust currently stores useful debug detail and sets `traceback` to `null`; exact language stack parity is intentionally not implemented because stable Rust does not expose portable async task traceback capture for arbitrary user futures.
+
 ## Development
 
 ```sh
@@ -248,11 +280,15 @@ cargo deny check advisories bans licenses sources
 cargo package
 ```
 
-Database integration tests are ignored by default because they require a Postgres database initialized with Absurd SQL:
+Database integration tests are ignored by default. To run them, start Postgres 16 or newer, install Absurd SQL into a test database, and use the cargo alias:
 
 ```sh
-ABSURD_DATABASE_URL=postgresql://localhost/absurd_test cargo test --test integration -- --ignored
+export ABSURD_DATABASE_URL=postgresql://localhost/absurd_test
+psql "$ABSURD_DATABASE_URL" -v ON_ERROR_STOP=1 -f /path/to/absurd/sql/absurd.sql
+cargo test-db
 ```
+
+CI runs the same ignored database suite against Postgres 16 with upstream Absurd SQL tag `0.4.0`.
 
 `Cargo.lock` is intentionally not committed because this is a library crate; CI resolves the current compatible dependency graph and Dependabot tracks manifest/action updates.
 

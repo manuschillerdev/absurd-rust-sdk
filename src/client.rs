@@ -1,9 +1,15 @@
 use crate::context::TaskContext;
 use crate::error::{Error, Result, map_database_error};
-use crate::executor::execute_claimed_catching;
+use crate::executor::{TaskExecutionConfig, execute_claimed_catching};
+use crate::hooks::Hooks;
 use crate::task::Task;
+use crate::task_result::{
+    AwaitTaskResultOptions, TaskResultSnapshot, await_task_result_with_backoff,
+    fetch_task_result_snapshot,
+};
 use crate::types::{
-    CancellationPolicy, ClaimedTask, CleanupResult, Json, SpawnOptions, SpawnResult, TaskOptions,
+    CancellationPolicy, ClaimedTask, CleanupResult, CreateQueueOptions, Json, QueuePolicy,
+    QueuePolicyOptions, QueueStorageMode, RetryTaskOptions, SpawnOptions, SpawnResult, TaskOptions,
     WorkBatchOptions, WorkerOptions, duration_seconds_ceil, validate_queue_name,
 };
 use crate::worker::Worker;
@@ -26,6 +32,7 @@ pub struct Client {
     pub(crate) pool: Pool,
     queue_name: String,
     default_max_attempts: i32,
+    hooks: Hooks,
     registry: Arc<RwLock<HashMap<String, RegisteredTask>>>,
 }
 
@@ -40,6 +47,10 @@ pub(crate) struct RegisteredTask {
 impl Client {
     pub async fn connect(database_url: impl AsRef<str>) -> Result<Self> {
         Self::connect_queue(database_url, "default").await
+    }
+
+    pub async fn connect_with_hooks(database_url: impl AsRef<str>, hooks: Hooks) -> Result<Self> {
+        Ok(Self::connect(database_url).await?.with_hooks(hooks))
     }
 
     pub async fn connect_queue(
@@ -64,8 +75,19 @@ impl Client {
         Self::connect(resolve_database_url(None)).await
     }
 
+    pub async fn from_env_with_hooks(hooks: Hooks) -> Result<Self> {
+        Self::connect_with_hooks(resolve_database_url(None), hooks).await
+    }
+
     pub async fn from_env_queue(queue_name: impl Into<String>) -> Result<Self> {
         Self::connect_queue(resolve_database_url(None), queue_name).await
+    }
+
+    pub async fn from_env_queue_with_hooks(
+        queue_name: impl Into<String>,
+        hooks: Hooks,
+    ) -> Result<Self> {
+        Self::connect_queue_with_hooks(resolve_database_url(None), queue_name, hooks).await
     }
 
     pub fn from_pool(pool: Pool, queue_name: impl Into<String>) -> Result<Self> {
@@ -75,8 +97,27 @@ impl Client {
             pool,
             queue_name,
             default_max_attempts: 5,
+            hooks: Hooks::default(),
             registry: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub async fn connect_queue_with_hooks(
+        database_url: impl AsRef<str>,
+        queue_name: impl Into<String>,
+        hooks: Hooks,
+    ) -> Result<Self> {
+        Ok(Self::connect_queue(database_url, queue_name)
+            .await?
+            .with_hooks(hooks))
+    }
+
+    pub fn from_pool_with_hooks(
+        pool: Pool,
+        queue_name: impl Into<String>,
+        hooks: Hooks,
+    ) -> Result<Self> {
+        Ok(Self::from_pool(pool, queue_name)?.with_hooks(hooks))
     }
 
     pub fn queue_name(&self) -> &str {
@@ -86,6 +127,15 @@ impl Client {
     pub fn default_max_attempts(mut self, value: i32) -> Self {
         self.default_max_attempts = value;
         self
+    }
+
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    pub fn hooks(&self) -> &Hooks {
+        &self.hooks
     }
 
     pub fn register<P, R, F, Fut>(&self, task: &Task<P, R>, handler: F) -> Result<()>
@@ -205,9 +255,13 @@ impl Client {
             return Err(Error::Config("task name must be provided".to_string()));
         }
 
+        let params = serde_json::to_value(params)?;
+        let options = self
+            .hooks
+            .apply_before_spawn(task_name, params.clone(), options)
+            .await?;
         let (queue_name, max_attempts, cancellation) =
             self.resolve_spawn(task_name, task_options, &options)?;
-        let params = serde_json::to_value(params)?;
         let options_json = options.to_sql_json(max_attempts, cancellation);
 
         let client = self.pool.get().await?;
@@ -242,6 +296,107 @@ impl Client {
             .await
             .map_err(map_database_error)?;
         Ok(())
+    }
+
+    pub async fn create_queue_with_options(&self, options: CreateQueueOptions) -> Result<()> {
+        let queue_name = self.queue_name.clone();
+        self.create_queue_in_with_options(queue_name, options).await
+    }
+
+    pub async fn create_queue_in_with_options(
+        &self,
+        queue_name: impl AsRef<str>,
+        options: CreateQueueOptions,
+    ) -> Result<()> {
+        let queue_name = queue_name.as_ref();
+        validate_queue_name(queue_name)?;
+        let client = self.pool.get().await?;
+        if options.storage_mode == QueueStorageMode::Unpartitioned {
+            client
+                .execute("SELECT absurd.create_queue($1)", &[&queue_name])
+                .await
+                .map_err(map_database_error)?;
+        } else {
+            let storage_mode = options.storage_mode.as_str();
+            client
+                .execute(
+                    "SELECT absurd.create_queue($1, $2)",
+                    &[&queue_name, &storage_mode],
+                )
+                .await
+                .map_err(map_database_error)?;
+        }
+
+        self.set_queue_policy_in(queue_name, options.policy_options())
+            .await
+    }
+
+    pub async fn set_queue_policy(&self, options: QueuePolicyOptions) -> Result<()> {
+        let queue_name = self.queue_name.clone();
+        self.set_queue_policy_in(queue_name, options).await
+    }
+
+    pub async fn set_queue_policy_in(
+        &self,
+        queue_name: impl AsRef<str>,
+        options: QueuePolicyOptions,
+    ) -> Result<()> {
+        let queue_name = queue_name.as_ref();
+        validate_queue_name(queue_name)?;
+        if options.is_empty() {
+            return Ok(());
+        }
+
+        let policy = options.to_sql_json();
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "SELECT absurd.set_queue_policy($1, $2::jsonb)",
+                &[&queue_name, &policy],
+            )
+            .await
+            .map_err(map_database_error)?;
+        Ok(())
+    }
+
+    pub async fn get_queue_policy(&self) -> Result<Option<QueuePolicy>> {
+        let queue_name = self.queue_name.clone();
+        self.get_queue_policy_in(queue_name).await
+    }
+
+    pub async fn get_queue_policy_in(
+        &self,
+        queue_name: impl AsRef<str>,
+    ) -> Result<Option<QueuePolicy>> {
+        let queue_name = queue_name.as_ref();
+        validate_queue_name(queue_name)?;
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT queue_name, storage_mode, partition_lookahead::text,
+                        partition_lookback::text, cleanup_ttl::text, cleanup_limit,
+                        detach_mode, detach_min_age::text
+                 FROM absurd.get_queue_policy($1)",
+                &[&queue_name],
+            )
+            .await
+            .map_err(map_database_error)?;
+
+        row.map(|row| {
+            let storage_mode: String = row.get(1);
+            let detach_mode: String = row.get(6);
+            Ok(QueuePolicy {
+                queue_name: row.get(0),
+                storage_mode: storage_mode.parse()?,
+                partition_lookahead: row.get(2),
+                partition_lookback: row.get(3),
+                cleanup_ttl: row.get(4),
+                cleanup_limit: row.get(5),
+                detach_mode: detach_mode.parse()?,
+                detach_min_age: row.get(7),
+            })
+        })
+        .transpose()
     }
 
     pub async fn drop_queue(&self) -> Result<()> {
@@ -294,6 +449,65 @@ impl Client {
             .await
             .map_err(map_database_error)?;
         Ok(())
+    }
+
+    pub async fn retry_task(
+        &self,
+        task_id: Uuid,
+        options: RetryTaskOptions,
+    ) -> Result<SpawnResult> {
+        let queue_name = options.queue.as_deref().unwrap_or(&self.queue_name);
+        validate_queue_name(queue_name)?;
+        let options_json = options.to_sql_json()?;
+
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT task_id, run_id, attempt, created
+                 FROM absurd.retry_task($1, $2, $3)",
+                &[&queue_name, &task_id, &options_json],
+            )
+            .await
+            .map_err(map_database_error)?;
+
+        Ok(SpawnResult {
+            task_id: row.get(0),
+            run_id: row.get(1),
+            attempt: row.get(2),
+            created: row.get(3),
+        })
+    }
+
+    pub async fn fetch_task_result(
+        &self,
+        task_id: Uuid,
+        queue_name: Option<&str>,
+    ) -> Result<Option<TaskResultSnapshot>> {
+        let queue_name = queue_name.unwrap_or(&self.queue_name);
+        validate_queue_name(queue_name)?;
+        fetch_task_result_snapshot(&self.pool, queue_name, task_id).await
+    }
+
+    pub async fn await_task_result(
+        &self,
+        task_id: Uuid,
+        options: AwaitTaskResultOptions,
+    ) -> Result<TaskResultSnapshot> {
+        let queue_name = options.queue.as_deref().unwrap_or(&self.queue_name);
+        validate_queue_name(queue_name)?;
+        let pool = self.pool.clone();
+        let queue_name = queue_name.to_string();
+        await_task_result_with_backoff(
+            || {
+                let pool = pool.clone();
+                let queue_name = queue_name.clone();
+                async move { fetch_task_result_snapshot(&pool, &queue_name, task_id).await }
+            },
+            task_id,
+            options.timeout,
+            || std::future::ready(Ok(())),
+        )
+        .await
     }
 
     pub async fn cancel_task(&self, task_id: Uuid, queue_name: Option<&str>) -> Result<()> {
@@ -361,9 +575,13 @@ impl Client {
                 self.queue_name.clone(),
                 self.registry.clone(),
                 task,
-                options.claim_timeout,
-                options.unknown_task_policy,
-                false,
+                TaskExecutionConfig {
+                    hooks: self.hooks.clone(),
+                    claim_timeout: options.claim_timeout,
+                    unknown_task_policy: options.unknown_task_policy,
+                    fatal_on_lease_timeout: false,
+                    on_error: None,
+                },
             )
             .await?;
         }
@@ -376,6 +594,7 @@ impl Client {
             self.pool.clone(),
             self.queue_name.clone(),
             self.registry.clone(),
+            self.hooks.clone(),
             options,
         )
     }

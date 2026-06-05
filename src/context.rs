@@ -1,5 +1,9 @@
 use crate::error::{Error, Result, map_database_error};
-use crate::types::{ClaimedTask, Json, duration_seconds_ceil};
+use crate::task_result::{
+    AwaitTaskResultOptions, TaskResultSnapshot, await_task_result_with_backoff,
+    fetch_task_result_snapshot,
+};
+use crate::types::{ClaimedTask, Json, duration_seconds_ceil, validate_queue_name};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Serialize, de::DeserializeOwned};
@@ -8,7 +12,34 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use uuid::Uuid;
+
+/// Handle returned by [`TaskContext::begin_step`] for decomposed step execution.
+///
+/// A handle represents one concrete checkpoint slot, including automatic
+/// numbering for repeated step names.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct StepHandle<T = Json> {
+    pub name: String,
+    pub checkpoint_name: String,
+    pub done: bool,
+    pub state: Option<T>,
+}
+
+impl<T> StepHandle<T> {
+    fn into_cached_state(self) -> Result<T> {
+        self.state
+            .ok_or_else(|| completed_step_missing_state(&self.checkpoint_name))
+    }
+}
+
+fn completed_step_missing_state(checkpoint_name: &str) -> Error {
+    Error::Config(format!(
+        "completed step handle {checkpoint_name:?} is missing cached state"
+    ))
+}
 
 #[derive(Debug)]
 pub struct TaskContext {
@@ -28,7 +59,7 @@ impl TaskContext {
     pub(crate) async fn new(
         pool: Pool,
         queue_name: String,
-        task: ClaimedTask,
+        mut task: ClaimedTask,
         claim_timeout: Duration,
         lease_tx: Option<watch::Sender<Duration>>,
     ) -> Result<Self> {
@@ -49,7 +80,7 @@ impl TaskContext {
             checkpoint_cache.insert(name, state);
         }
 
-        let headers = match task.headers.clone() {
+        let headers = match task.headers.take() {
             None | Some(Value::Null) => Map::new(),
             Some(Value::Object(headers)) => headers,
             Some(_) => return Err(Error::InvalidHeaders),
@@ -67,6 +98,28 @@ impl TaskContext {
             claim_timeout_seconds: duration_seconds_ceil(claim_timeout),
             lease_tx,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        pool: Pool,
+        queue_name: String,
+        task: ClaimedTask,
+        headers: Map<String, Value>,
+        claim_timeout: Duration,
+    ) -> Self {
+        Self {
+            pool,
+            queue_name,
+            task,
+            headers,
+            checkpoint_cache: HashMap::new(),
+            step_name_counter: HashMap::new(),
+            reported_timeouts: HashSet::new(),
+            claim_timeout,
+            claim_timeout_seconds: duration_seconds_ceil(claim_timeout),
+            lease_tx: None,
+        }
     }
 
     pub fn task_id(&self) -> Uuid {
@@ -99,15 +152,55 @@ impl TaskContext {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let checkpoint_name = self.next_checkpoint_name(name.as_ref());
-        if let Some(cached) = self.lookup_checkpoint(&checkpoint_name).await? {
-            return Ok(serde_json::from_value(cached)?);
+        let handle = self.begin_step::<T>(name).await?;
+        if handle.done {
+            return handle.into_cached_state();
         }
 
         let result = f().await?;
-        let value = serde_json::to_value(&result)?;
-        self.persist_checkpoint(&checkpoint_name, &value).await?;
-        Ok(result)
+        self.complete_step(handle, result).await
+    }
+
+    /// Starts a step and checks whether its checkpoint already exists.
+    pub async fn begin_step<T>(&mut self, name: impl AsRef<str>) -> Result<StepHandle<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let name = name.as_ref().to_string();
+        let checkpoint_name = self.next_checkpoint_name(&name);
+        if let Some(cached) = self.lookup_checkpoint(&checkpoint_name).await? {
+            return Ok(StepHandle {
+                name,
+                checkpoint_name,
+                done: true,
+                state: Some(serde_json::from_value(cached)?),
+            });
+        }
+
+        Ok(StepHandle {
+            name,
+            checkpoint_name,
+            done: false,
+            state: None,
+        })
+    }
+
+    /// Completes a step started with [`TaskContext::begin_step`] by persisting its state.
+    ///
+    /// If the handle is already done, this returns the cached state.
+    pub async fn complete_step<T>(&mut self, handle: StepHandle<T>, value: T) -> Result<T>
+    where
+        T: Serialize,
+    {
+        if handle.done {
+            return handle.into_cached_state();
+        }
+
+        let checkpoint_name = handle.checkpoint_name;
+        let value_json = serde_json::to_value(&value)?;
+        self.persist_checkpoint(&checkpoint_name, &value_json)
+            .await?;
+        Ok(value)
     }
 
     pub async fn sleep_for(&mut self, name: impl AsRef<str>, duration: Duration) -> Result<()> {
@@ -228,6 +321,75 @@ impl TaskContext {
         Ok(serde_json::from_value(payload)?)
     }
 
+    pub async fn await_task_result(
+        &mut self,
+        task_id: Uuid,
+        options: AwaitTaskResultOptions,
+    ) -> Result<TaskResultSnapshot> {
+        let queue_name = options.queue.as_deref().unwrap_or(&self.queue_name);
+        validate_queue_name(queue_name)?;
+        if queue_name == self.queue_name.as_str() {
+            return Err(Error::Config(
+                "TaskContext.await_task_result cannot wait on tasks in the same queue because this can deadlock workers. Spawn the child in a different queue and pass options.queue."
+                    .to_string(),
+            ));
+        }
+        let queue_name = queue_name.to_string();
+
+        let default_step_name = format!("$awaitTaskResult:{task_id}");
+        let step_name = options
+            .step_name
+            .as_deref()
+            .unwrap_or(default_step_name.as_str());
+        let checkpoint_name = self.next_checkpoint_name(step_name);
+
+        if let Some(cached) = self.lookup_checkpoint(&checkpoint_name).await? {
+            return Ok(serde_json::from_value(cached)?);
+        }
+
+        let heartbeat_interval = (self.claim_timeout / 2).max(Duration::from_millis(500));
+        let mut next_heartbeat_at = Instant::now() + heartbeat_interval;
+        let fetch_pool = self.pool.clone();
+        let heartbeat_pool = self.pool.clone();
+        let heartbeat_queue_name = self.queue_name.clone();
+        let run_id = self.task.run_id;
+        let claim_timeout = self.claim_timeout;
+        let lease_tx = self.lease_tx.clone();
+
+        let snapshot = await_task_result_with_backoff(
+            || {
+                let pool = fetch_pool.clone();
+                let queue_name = queue_name.clone();
+                async move { fetch_task_result_snapshot(&pool, &queue_name, task_id).await }
+            },
+            task_id,
+            options.timeout,
+            || {
+                let should_heartbeat = Instant::now() >= next_heartbeat_at;
+                if should_heartbeat {
+                    next_heartbeat_at = Instant::now() + heartbeat_interval;
+                }
+                let pool = heartbeat_pool.clone();
+                let queue_name = heartbeat_queue_name.clone();
+                let lease_tx = lease_tx.clone();
+                async move {
+                    if should_heartbeat {
+                        extend_claim(&pool, &queue_name, run_id, claim_timeout).await?;
+                        if let Some(tx) = lease_tx {
+                            let _ = tx.send(claim_timeout);
+                        }
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await?;
+
+        let value = serde_json::to_value(&snapshot)?;
+        self.persist_checkpoint(&checkpoint_name, &value).await?;
+        Ok(snapshot)
+    }
+
     pub async fn emit_event<T>(&self, event_name: impl AsRef<str>, payload: &T) -> Result<()>
     where
         T: Serialize + ?Sized,
@@ -253,15 +415,7 @@ impl TaskContext {
     }
 
     pub async fn heartbeat_for(&self, duration: Duration) -> Result<()> {
-        let seconds = duration_seconds_ceil(duration);
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "SELECT absurd.extend_claim($1, $2, $3)",
-                &[&self.queue_name, &self.task.run_id, &seconds],
-            )
-            .await
-            .map_err(map_database_error)?;
+        extend_claim(&self.pool, &self.queue_name, self.task.run_id, duration).await?;
         self.notify_lease_extended(duration);
         Ok(())
     }
@@ -341,6 +495,24 @@ impl TaskContext {
             let _ = tx.send(duration);
         }
     }
+}
+
+async fn extend_claim(
+    pool: &Pool,
+    queue_name: &str,
+    run_id: Uuid,
+    duration: Duration,
+) -> Result<()> {
+    let seconds = duration_seconds_ceil(duration);
+    let client = pool.get().await?;
+    client
+        .execute(
+            "SELECT absurd.extend_claim($1, $2, $3)",
+            &[&queue_name, &run_id, &seconds],
+        )
+        .await
+        .map_err(map_database_error)?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]

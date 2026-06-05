@@ -10,7 +10,7 @@ repository = "https://github.com/manuschillerdev/absurd-rust-sdk"
 readme = "README.md"
 keywords = ["absurd", "postgres", "workflow", "durable", "queue"]
 categories = ["asynchronous", "database"]
-include = ["Cargo.toml", "LICENSE", "README.md", "examples/**", "src/**", "tests/**"]
+include = ["Cargo.toml", "LICENSE", "README.md", "docs/**", "examples/**", "src/**", "tests/**"]
 
 [lib]
 name = "absurd_rust_sdk"
