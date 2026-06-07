@@ -4,7 +4,7 @@ use crate::task_result::{
     fetch_task_result_snapshot,
 };
 use crate::types::{ClaimedTask, Json, duration_seconds_ceil, validate_queue_name};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use deadpool_postgres::Pool;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -204,14 +204,12 @@ impl TaskContext {
     }
 
     pub async fn sleep_for(&mut self, name: impl AsRef<str>, duration: Duration) -> Result<()> {
-        self.sleep_until(
-            name,
-            Utc::now()
-                + chrono::Duration::from_std(duration).map_err(|_| {
-                    Error::Config("sleep duration is too large for chrono".to_string())
-                })?,
-        )
-        .await
+        let duration = chrono::Duration::from_std(duration)
+            .map_err(|_| Error::Config("sleep duration is too large for chrono".to_string()))?;
+        let name = name.as_ref().to_string();
+        let now = self.current_time().await?;
+        self.sleep_until_at_current_time(&name, now + duration, now)
+            .await
     }
 
     pub async fn sleep_until(
@@ -219,7 +217,19 @@ impl TaskContext {
         name: impl AsRef<str>,
         wake_at: DateTime<Utc>,
     ) -> Result<()> {
-        let checkpoint_name = self.next_checkpoint_name(name.as_ref());
+        let name = name.as_ref().to_string();
+        let now = self.current_time().await?;
+        self.sleep_until_at_current_time(&name, wake_at, now).await
+    }
+
+    async fn sleep_until_at_current_time(
+        &mut self,
+        name: &str,
+        wake_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let checkpoint_name = self.next_checkpoint_name(name);
+        let wake_at = postgres_timestamp_precision(wake_at);
         let actual_wake_at = if let Some(cached) = self.lookup_checkpoint(&checkpoint_name).await? {
             serde_json::from_value(cached)?
         } else {
@@ -228,7 +238,7 @@ impl TaskContext {
             wake_at
         };
 
-        if Utc::now() < actual_wake_at {
+        if now < actual_wake_at {
             self.schedule_run(actual_wake_at).await?;
             return Err(Error::Suspended);
         }
@@ -490,11 +500,27 @@ impl TaskContext {
         Ok(())
     }
 
+    async fn current_time(&self) -> Result<DateTime<Utc>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one("SELECT absurd.current_time()", &[])
+            .await
+            .map_err(map_database_error)?;
+        Ok(row.get(0))
+    }
+
     fn notify_lease_extended(&self, duration: Duration) {
         if let Some(tx) = &self.lease_tx {
             let _ = tx.send(duration);
         }
     }
+}
+
+fn postgres_timestamp_precision(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    let truncated_nanos = timestamp.timestamp_subsec_micros() * 1_000;
+    timestamp
+        .with_nanosecond(truncated_nanos)
+        .unwrap_or(timestamp)
 }
 
 async fn extend_claim(
@@ -513,6 +539,34 @@ async fn extend_claim(
         .await
         .map_err(map_database_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_timestamp_precision_truncates_sub_microsecond_nanos() -> Result<()> {
+        let timestamp = DateTime::from_timestamp(1_777_000_000, 123_456_789)
+            .ok_or_else(|| Error::Config("valid timestamp".to_string()))?;
+
+        let normalized = postgres_timestamp_precision(timestamp);
+
+        assert_eq!(normalized.timestamp(), timestamp.timestamp());
+        assert_eq!(normalized.timestamp_subsec_nanos(), 123_456_000);
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_timestamp_precision_preserves_microsecond_values() -> Result<()> {
+        let timestamp = DateTime::from_timestamp(1_777_000_000, 123_456_000)
+            .ok_or_else(|| Error::Config("valid timestamp".to_string()))?;
+
+        let normalized = postgres_timestamp_precision(timestamp);
+
+        assert_eq!(normalized, timestamp);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]

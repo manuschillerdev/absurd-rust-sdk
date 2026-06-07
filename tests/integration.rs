@@ -1486,27 +1486,68 @@ async fn repeated_step_names_are_numbered() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires a Postgres database initialized with Absurd SQL"]
-async fn sleep_until_suspends_then_resumes_from_checkpoint() -> Result<()> {
-    let (queue, client) = test_client().await?;
+async fn sleep_for_suspends_until_duration_elapses() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-05T10:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+
+    let task = Task::<(), Value>::new("sleep-for").queue(&queue);
+    client.register(&task, |(), mut ctx| async move {
+        ctx.sleep_for("wait-for", Duration::from_secs(60)).await?;
+        Ok(json!({ "resumed": true }))
+    })?;
+
+    let spawned = client.spawn(&task, (), Default::default()).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    let run = fetch_run(&queue, spawned.run_id).await?;
+    let wake_at = base + ChronoDuration::seconds(60);
+    assert_eq!(task.state, "sleeping");
+    assert_eq!(run.state, "sleeping");
+    assert_eq!(run.available_at, Some(wake_at));
+
+    set_fake_now(&pool, Some(wake_at + ChronoDuration::seconds(5))).await?;
+    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let task = fetch_task(&queue, spawned.task_id).await?;
+    assert_eq!(task.state, "completed");
+    assert_eq!(task.completed_payload, Some(json!({ "resumed": true })));
+
+    client.drop_queue().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Postgres database initialized with Absurd SQL"]
+async fn sleep_until_checkpoint_prevents_rescheduling() -> Result<()> {
+    let (queue, client, pool) = test_client_with_single_connection_pool().await?;
+    let base = utc("2024-05-06T09:00:00Z")?;
+    set_fake_now(&pool, Some(base)).await?;
+    let wake_at = base + ChronoDuration::minutes(5);
     let executions = Arc::new(AtomicUsize::new(0));
 
-    let task = Task::<(), Value>::new("sleepy").queue(&queue);
+    let task = Task::<(), Value>::new("sleep-until").queue(&queue);
     client.register(&task, {
         let executions = Arc::clone(&executions);
         move |(), mut ctx| {
             let executions = Arc::clone(&executions);
             async move {
                 let execution = executions.fetch_add(1, Ordering::SeqCst) + 1;
-                let wake_at = Utc::now() + ChronoDuration::seconds(1);
-                ctx.sleep_until("pause", wake_at).await?;
+                ctx.sleep_until("sleep-step", wake_at).await?;
                 Ok(json!({ "executions": execution }))
             }
         }
     })?;
 
     let spawned = client.spawn(&task, (), Default::default()).await?;
-
     assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
+
+    let checkpoints = fetch_checkpoints(&queue, spawned.task_id).await?;
+    assert_eq!(
+        checkpoints,
+        vec![("sleep-step".to_string(), serde_json::to_value(wake_at)?)],
+    );
 
     let task = fetch_task(&queue, spawned.task_id).await?;
     let run = fetch_run(&queue, spawned.run_id).await?;
@@ -1514,16 +1555,9 @@ async fn sleep_until_suspends_then_resumes_from_checkpoint() -> Result<()> {
     assert_eq!(run.state, "sleeping");
     assert!(run.wake_event.is_none());
     assert!(run.failure_reason.is_none());
+    assert_eq!(run.available_at, Some(wake_at));
 
-    let checkpoints = fetch_checkpoints(&queue, spawned.task_id).await?;
-    assert_eq!(checkpoints.len(), 1);
-    assert_eq!(checkpoints[0].0, "pause");
-    let checkpoint_wake: DateTime<Utc> = serde_json::from_value(checkpoints[0].1.clone())?;
-    assert_eq!(run.available_at, Some(checkpoint_wake));
-
-    assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 0);
-
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    set_fake_now(&pool, Some(wake_at)).await?;
     assert_eq!(client.work_batch(WorkBatchOptions::new()).await?, 1);
 
     let task = fetch_task(&queue, spawned.task_id).await?;
