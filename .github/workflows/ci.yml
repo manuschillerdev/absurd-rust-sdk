@@ -33,7 +33,7 @@ jobs:
     env:
       ABSURD_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/absurd_test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Checkout Absurd SQL
         run: git clone --depth 1 --branch "$ABSURD_SQL_REF" https://github.com/earendil-works/absurd "$RUNNER_TEMP/absurd-upstream"
       - uses: dtolnay/rust-toolchain@stable
@@ -57,7 +57,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features
@@ -66,7 +66,7 @@ jobs:
     name: Dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
